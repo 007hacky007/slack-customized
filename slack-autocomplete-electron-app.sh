@@ -119,7 +119,7 @@ fi
 # main.js  (includes User-Agent override)
 # ---------------------------------------------------------------------------
 cat > main.js <<'EOF'
-const { app, BrowserWindow, session, nativeImage } = require('electron');
+const { app, BrowserWindow, session, nativeImage, ipcMain, shell } = require('electron');
 const fs = require('fs');
 const path = require('path');
 
@@ -153,6 +153,15 @@ GPU_SWITCHES.forEach(([name, value]) => {
     app.commandLine.appendSwitch(name);
   }
 });
+
+function openExternalUrl(targetUrl) {
+  if (!targetUrl) return;
+  try {
+    shell.openExternal(targetUrl);
+  } catch (err) {
+    console.warn('Failed to open external URL:', targetUrl, err);
+  }
+}
 
 function isSlackUrl(targetUrl) {
   try {
@@ -326,6 +335,7 @@ function applyWindowPolicies(win) {
   win.webContents.session.setUserAgent(CHROME_UA);
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (!isSlackUrl(url)) {
+      openExternalUrl(url);
       return { action: 'deny' };
     }
 
@@ -333,6 +343,13 @@ function applyWindowPolicies(win) {
       action: 'allow',
       overrideBrowserWindowOptions: buildWindowOptions()
     };
+  });
+
+  win.webContents.on('will-navigate', (event, url) => {
+    if (!isSlackUrl(url)) {
+      event.preventDefault();
+      openExternalUrl(url);
+    }
   });
 }
 
@@ -343,6 +360,20 @@ function createWindow(initialUrl = SLACK_URL) {
   attachWindowStateTracking(win, initialUrl);
   return win;
 }
+
+ipcMain.handle('slack-autocomplete:open-window', async (_event, targetUrl) => {
+  if (typeof targetUrl !== 'string') {
+    return { status: 'error', reason: 'invalid-url' };
+  }
+
+  if (!isSlackUrl(targetUrl)) {
+    openExternalUrl(targetUrl);
+    return { status: 'external-opened' };
+  }
+
+  createWindow(targetUrl);
+  return { status: 'created' };
+});
 
 app.whenReady().then(() => {
   // Global default UA (covers auth popups etc.).
@@ -394,6 +425,8 @@ cat > preload.js <<'EOF'
   if (!location.hostname.endsWith('slack.com')) {
     return;
   }
+
+  const { ipcRenderer } = require('electron');
 
   const DEBUG = (() => {
     try {
@@ -632,13 +665,25 @@ cat > preload.js <<'EOF'
     );
   }
 
-  function openSlackWindow(url) {
-    if (!url) return;
+  function fallbackWindowOpen(url) {
     try {
       window.open(url, '_blank', 'noopener');
     } catch (err) {
-      log('Failed to open new window', err);
+      log('Failed to open new window via fallback', err);
     }
+  }
+
+  function openSlackWindow(url) {
+    if (!url) return;
+    if (ipcRenderer?.invoke) {
+      ipcRenderer.invoke('slack-autocomplete:open-window', url).catch((err) => {
+        log('IPC open-window failed, falling back to window.open', err);
+        fallbackWindowOpen(url);
+      });
+      return;
+    }
+
+    fallbackWindowOpen(url);
   }
 
   function closeContextMenus() {
