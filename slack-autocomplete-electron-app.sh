@@ -395,11 +395,19 @@ cat > preload.js <<'EOF'
     return;
   }
 
-  const DEBUG = false;
+  const DEBUG = (() => {
+    try {
+      return Boolean(window?.localStorage?.getItem('slackAutocompleteDebug'));
+    } catch (err) {
+      return false;
+    }
+  })();
   const CHANNEL_CONTEXT_TTL = 4000;
+  const LISTBOX_SCAN_INTERVAL_MS = 140;
+  const LISTBOX_IDLE_TIMEOUT_MS = 1500;
   const THREAD_CONTEXT_REFRESH_INTERVAL = 1500;
-  const THREAD_GLOBAL_SCAN_MAX_NODES = 2000;
-  const THREAD_GLOBAL_SCAN_MAX_DEPTH = 6;
+  const THREAD_GLOBAL_SCAN_MAX_NODES = 12000;
+  const THREAD_GLOBAL_SCAN_MAX_DEPTH = 8;
   const THREAD_BUTTON_ID = 'slack-autocomplete-thread-popout';
   const THREAD_BUTTON_WRAPPER_ID = 'slack-autocomplete-thread-popout-wrapper';
   const CHANNEL_MENU_ITEM_QA = 'slack_autocomplete_open_window';
@@ -411,12 +419,50 @@ cat > preload.js <<'EOF'
   let menuScanHandle = null;
   let listboxObserver = null;
   let listboxScanHandle = null;
+  let listboxIntervalHandle = null;
+  let listboxLastSeenAt = 0;
   let cachedThreadContext = null;
   let cachedThreadContextTimestamp = 0;
+  let lastThreadContextSource = null;
+  let lastThreadContextError = null;
 
   function log(...args) {
     if (!DEBUG) return;
     console.log('[SlackAutocompletePreload]', ...args);
+  }
+
+  function exposeDebugHelpers() {
+    const api = {
+      getThreadContext() {
+        return {
+          cachedThreadContext,
+          cachedThreadContextTimestamp,
+          lastThreadContextSource,
+          lastThreadContextError,
+          buttonState: document.getElementById(THREAD_BUTTON_ID)?.dataset?.state || null
+        };
+      },
+      forceThreadRefresh() {
+        refreshThreadContext(true);
+        return api.getThreadContext();
+      },
+      enableDebug() {
+        try {
+          window.localStorage.setItem('slackAutocompleteDebug', '1');
+        } catch (err) {
+          console.error('Unable to persist debug flag', err);
+        }
+      },
+      disableDebug() {
+        try {
+          window.localStorage.removeItem('slackAutocompleteDebug');
+        } catch (err) {
+          console.error('Unable to remove debug flag', err);
+        }
+      }
+    };
+
+    window.slackAutocomplete = Object.freeze(api);
   }
 
   function isVisible(el) {
@@ -473,6 +519,10 @@ cat > preload.js <<'EOF'
 
   function scanForListboxes() {
     const listboxes = document.querySelectorAll('[role="listbox"]');
+    if (listboxes.length) {
+      listboxLastSeenAt = Date.now();
+    }
+
     listboxes.forEach((lb) => {
       ensureFirstOptionSelected(lb);
     });
@@ -484,6 +534,29 @@ cat > preload.js <<'EOF'
       listboxScanHandle = null;
       scanForListboxes();
     });
+    startListboxInterval();
+  }
+
+  function stopListboxIntervalWhenIdle() {
+    if (!listboxIntervalHandle) return;
+    const idle = Date.now() - listboxLastSeenAt;
+    if (idle > LISTBOX_IDLE_TIMEOUT_MS) {
+      clearInterval(listboxIntervalHandle);
+      listboxIntervalHandle = null;
+    }
+  }
+
+  function startListboxInterval() {
+    if (listboxIntervalHandle) return;
+    listboxLastSeenAt = Date.now();
+    listboxIntervalHandle = setInterval(() => {
+      if (document.hidden) {
+        stopListboxIntervalWhenIdle();
+        return;
+      }
+      scanForListboxes();
+      stopListboxIntervalWhenIdle();
+    }, LISTBOX_SCAN_INTERVAL_MS);
   }
 
   function handleListboxMutations(mutations) {
@@ -512,6 +585,7 @@ cat > preload.js <<'EOF'
 
   function setupAutocompleteObservers() {
     scanForListboxes();
+    startListboxInterval();
 
     if (listboxObserver) {
       listboxObserver.disconnect();
@@ -876,6 +950,14 @@ cat > preload.js <<'EOF'
     '[data-qa="flexpane-title-container"]',
     '.p-flexpane_header__primary'
   ];
+  const THREAD_MESSAGE_SELECTORS = [
+    '[data-qa="message_container"]',
+    '.c-virtual_list__item',
+    '[data-item-key]'
+  ];
+  const THREAD_CONTAINER_SELECTOR = THREAD_CONTAINER_SELECTORS.join(', ');
+  const THREAD_HEADER_SELECTOR = THREAD_HEADER_SELECTORS.join(', ');
+  const THREAD_MESSAGE_SELECTOR = THREAD_MESSAGE_SELECTORS.join(', ');
 
   let threadObserver = null;
   let threadScanHandle = null;
@@ -910,6 +992,43 @@ cat > preload.js <<'EOF'
     return null;
   }
 
+  function threadContextFromUrl() {
+    try {
+      const url = new URL(window.location.href);
+      const searchParams = url.searchParams;
+      const hash = window.location.hash || '';
+      const hashQuery = hash.includes('?') ? hash.substring(hash.indexOf('?') + 1) : '';
+      const hashParams = new URLSearchParams(hashQuery);
+
+      const channelCandidates = [
+        searchParams.get('cid'),
+        searchParams.get('channel'),
+        searchParams.get('conversation'),
+        hashParams.get('cid'),
+        hashParams.get('channel'),
+        hashParams.get('conversation')
+      ];
+
+      const threadCandidates = [
+        searchParams.get('thread_ts'),
+        searchParams.get('thread_ts_root'),
+        hashParams.get('thread_ts'),
+        hashParams.get('thread_ts_root')
+      ];
+
+      const channelId = channelCandidates.map(coerceChannelId).find(Boolean);
+      const threadTs = threadCandidates.map(coerceThreadTs).find(Boolean);
+
+      if (channelId && threadTs) {
+        return { channelId, threadTs };
+      }
+    } catch (err) {
+      log('Failed to parse URL for thread context', err);
+    }
+
+    return null;
+  }
+
   function buildThreadUrl(channelId, threadTs) {
     if (!channelId || !threadTs) return null;
     const teamId = getCurrentTeamId();
@@ -927,8 +1046,9 @@ cat > preload.js <<'EOF'
     if (typeof value !== 'string') return null;
     const trimmed = value.trim();
     if (!trimmed) return null;
-    if (/^[CDGSPW][A-Z0-9]{7,}$/i.test(trimmed)) {
-      return trimmed;
+    const normalized = trimmed.toUpperCase();
+    if (/^[CDGSPW][A-Z0-9]{7,}$/.test(normalized)) {
+      return normalized;
     }
     return null;
   }
@@ -946,13 +1066,26 @@ cat > preload.js <<'EOF'
   function extractThreadDataFromElement(el) {
     if (!el) return null;
 
+    const virtualItem = el.closest?.('.c-virtual_list__item');
+    const virtualId = virtualItem?.id || '';
+    const virtualKey = virtualItem?.getAttribute?.('data-item-key');
+    const virtualTs = virtualItem?.querySelector?.('[data-ts]')?.getAttribute('data-ts');
+
     const threadAttrs = [
       'data-thread-root-ts',
       'data-thread-ts',
       'data-qa-thread-root-ts',
       'data-qa-thread-ts',
       'data-message-ts',
-      'data-qa-thread-root-message-ts'
+      'data-qa-thread-root-message-ts',
+      'data-qa-message-ts',
+      'data-root-ts',
+      'data-qa-root-ts',
+      'data-ts',
+      'data-qa-ts',
+      'data-thread-parent-ts',
+      'data-thread-root-message-id',
+      'data-qa-thread-root-message-id'
     ];
     const channelAttrs = [
       'data-channel-id',
@@ -961,7 +1094,12 @@ cat > preload.js <<'EOF'
       'data-message-channel-id',
       'data-conversation-id',
       'data-qa-conversation-id',
-      'data-qa-thread-channel-id'
+      'data-qa-thread-channel-id',
+      'data-qa-surface-channel-id',
+      'data-ts-channel-id',
+      'data-qa-ts-channel-id',
+      'data-root-channel-id',
+      'data-qa-inline-channel-id'
     ];
 
     let channelId = null;
@@ -978,16 +1116,36 @@ cat > preload.js <<'EOF'
     }
 
     if (!channelId) {
-      const channelCarrier = el.closest?.(
-        '[data-channel-id], [data-qa-channel-id], [data-qa-channel], [data-conversation-id], [data-qa-conversation-id]'
-      );
+      const carrierSelector = [
+        '[data-channel-id]',
+        '[data-qa-channel-id]',
+        '[data-qa-channel]',
+        '[data-message-channel-id]',
+        '[data-conversation-id]',
+        '[data-qa-conversation-id]',
+        '[data-qa-thread-channel-id]',
+        '[data-qa-surface-channel-id]',
+        '[data-ts-channel-id]',
+        '[data-qa-ts-channel-id]',
+        '[data-root-channel-id]',
+        '[data-qa-inline-channel-id]'
+      ].join(', ');
+
+      const channelCarrier = el.closest?.(carrierSelector);
       if (channelCarrier) {
         const attrsToTry = [
           'data-channel-id',
           'data-qa-channel-id',
           'data-qa-channel',
+          'data-message-channel-id',
           'data-conversation-id',
-          'data-qa-conversation-id'
+          'data-qa-conversation-id',
+          'data-qa-thread-channel-id',
+          'data-qa-surface-channel-id',
+          'data-ts-channel-id',
+          'data-qa-ts-channel-id',
+          'data-root-channel-id',
+          'data-qa-inline-channel-id'
         ];
         for (const attr of attrsToTry) {
           const value = channelCarrier.getAttribute(attr) || channelCarrier.dataset?.[datasetKeyFromAttr(attr)];
@@ -996,6 +1154,17 @@ cat > preload.js <<'EOF'
             channelId = coerced;
             break;
           }
+        }
+      }
+    }
+
+    if (!channelId && virtualId) {
+      const idParts = virtualId.split(/[-_]/);
+      for (const part of idParts) {
+        const coerced = coerceChannelId(part);
+        if (coerced) {
+          channelId = coerced;
+          break;
         }
       }
     }
@@ -1009,6 +1178,17 @@ cat > preload.js <<'EOF'
           messageContainer.dataset?.qaChannelId ||
           messageContainer.dataset?.channelId;
         channelId = coerceChannelId(value);
+
+        if (!channelId && virtualId) {
+          const idParts = virtualId.split(/[-_]/);
+          for (const part of idParts) {
+            const coerced = coerceChannelId(part);
+            if (coerced) {
+              channelId = coerced;
+              break;
+            }
+          }
+        }
       }
     }
 
@@ -1033,6 +1213,25 @@ cat > preload.js <<'EOF'
       }
     }
 
+    if (!threadTs && virtualKey) {
+      threadTs = coerceThreadTs(virtualKey);
+    }
+
+    if (!threadTs && virtualTs) {
+      threadTs = coerceThreadTs(virtualTs);
+    }
+
+    if (!threadTs && virtualId) {
+      const idParts = virtualId.split(/[-_]/);
+      for (const part of idParts) {
+        const coerced = coerceThreadTs(part);
+        if (coerced) {
+          threadTs = coerced;
+          break;
+        }
+      }
+    }
+
     if (channelId && threadTs) {
       return { channelId, threadTs };
     }
@@ -1041,17 +1240,48 @@ cat > preload.js <<'EOF'
   }
 
   function collectThreadDomCandidates() {
-    return [
-      document.querySelector('[data-qa="thread_permalink_button"]'),
-      document.querySelector('[data-qa="thread_permalink_button"] a[href*="/thread/"]'),
-      document.querySelector('.p-threads_flexpane__header_permalink'),
-      document.querySelector('[data-qa="thread-pane"] [data-thread-root-ts]'),
-      document.querySelector('[data-qa="thread-pane"] [data-thread-ts]'),
-      document.querySelector('.p-threads_view__root_message'),
-      document.querySelector('[data-qa="thread-pane"] [data-qa="message_container"]'),
-      document.querySelector('[data-qa="thread-pane"] [data-message-ts]'),
-      document.querySelector('[data-qa="ai_summary_summarize_thread_button"]')
-    ].filter(Boolean);
+    const selectors = [
+      '[data-qa="thread_permalink_button"]',
+      '[data-qa="thread_permalink_button"] a[href*="/thread/"]',
+      '.p-threads_flexpane__header_permalink',
+      '[data-qa="thread-pane"] [data-thread-root-ts]',
+      '[data-qa="thread-pane"] [data-thread-ts]',
+      '[data-qa="thread-pane"] [data-root-ts]',
+      '[data-qa="thread-pane"] [data-message-ts]',
+      '[data-qa="thread-pane"] [data-ts]',
+      '.p-threads_view__root_message',
+      '[data-qa="thread-pane"] [data-qa="message_container"]',
+      '[data-qa="ai_summary_summarize_thread_button"]',
+      '[data-qa="thread-pane"] [data-qa-thread-root-ts]',
+      '[data-qa="thread-pane"] [data-qa-thread-ts]',
+      '[data-qa="thread-pane"] .c-virtual_list__item',
+      '[data-qa="thread-pane"] [data-item-key]',
+      '[data-qa="thread-pane"] .c-message_kit__thread_message',
+      '.c-message_kit__thread_message',
+      '.c-virtual_list__item[id*="thread-list"]',
+      '[data-item-key*="thread"]'
+    ];
+
+    const seen = new Set();
+    const nodes = [];
+
+    function addNode(node) {
+      if (!node || !(node instanceof Element)) return;
+      if (seen.has(node)) return;
+      seen.add(node);
+      nodes.push(node);
+    }
+
+    selectors.forEach((selector) => {
+      document.querySelectorAll(selector).forEach(addNode);
+    });
+
+    const pane = document.querySelector('[data-qa="thread-pane"]') || document.querySelector('.p-threads_view');
+    if (pane) {
+      pane.querySelectorAll('[data-qa="message_container"], [data-thread-root-ts], [data-thread-ts]').forEach(addNode);
+    }
+
+    return nodes;
   }
 
   function deriveThreadContextFromDom() {
@@ -1101,6 +1331,12 @@ cat > preload.js <<'EOF'
 
     if (w.__remixContext?.state) {
       candidates.push(w.__remixContext.state);
+      if (w.__remixContext.state.loaderData) {
+        candidates.push(w.__remixContext.state.loaderData);
+      }
+      if (Array.isArray(w.__remixContext.state.matches)) {
+        candidates.push(...w.__remixContext.state.matches);
+      }
     }
 
     if (w.slackDebug?.store) {
@@ -1112,6 +1348,26 @@ cat > preload.js <<'EOF'
 
     if (w.__SLACK_GLOBAL_STATE__) {
       candidates.push(w.__SLACK_GLOBAL_STATE__);
+    }
+
+    if (w.__SLACK_WEBAPP_CONTEXT__) {
+      candidates.push(w.__SLACK_WEBAPP_CONTEXT__);
+    }
+
+    if (w.__INITIAL_STATE__) {
+      candidates.push(w.__INITIAL_STATE__);
+    }
+
+    if (w.__BOOTSTRAP_DATA__) {
+      candidates.push(w.__BOOTSTRAP_DATA__);
+    }
+
+    if (w.boot_data) {
+      candidates.push(w.boot_data);
+    }
+
+    if (w.__slackAutocompleteThreadContext) {
+      candidates.push(w.__slackAutocompleteThreadContext);
     }
 
     const ts = w.TS;
@@ -1154,7 +1410,12 @@ cat > preload.js <<'EOF'
       'conversationID',
       'root_channel_id',
       'destination_channel_id',
-      'selected_channel_id'
+      'selected_channel_id',
+      'selectedChannelId',
+      'selected_conversation_id',
+      'selectedConversationId',
+      'pane_channel_id',
+      'thread_channel_id'
     ];
 
     const threadKeys = [
@@ -1167,7 +1428,11 @@ cat > preload.js <<'EOF'
       'thread_root_ts',
       'threadRootTs',
       'selected_thread_ts',
-      'selectedThreadTs'
+      'selectedThreadTs',
+      'selected_message_ts',
+      'selectedMessageTs',
+      'current_thread_ts',
+      'currentThreadTs'
     ];
 
     const channelId =
@@ -1182,13 +1447,20 @@ cat > preload.js <<'EOF'
         })
         .find(Boolean) ||
       coerceChannelId(obj?.channel?.id || obj?.channel) ||
-      coerceChannelId(obj?.conversation?.id || obj?.conversation);
+      coerceChannelId(obj?.conversation?.id || obj?.conversation) ||
+      coerceChannelId(obj?.thread?.channel_id) ||
+      coerceChannelId(obj?.pane_channel_id);
 
     const threadTs =
       threadKeys
         .map((key) => coerceThreadTs(obj[key]))
         .find(Boolean) ||
-      coerceThreadTs(obj?.thread?.thread_ts || obj?.thread?.root_ts);
+      coerceThreadTs(obj?.thread?.thread_ts || obj?.thread?.root_ts) ||
+      coerceThreadTs(obj?.threadSidebar?.thread_ts) ||
+      coerceThreadTs(obj?.threadSidebar?.thread?.thread_ts) ||
+      coerceThreadTs(obj?.threadSidebar?.thread?.root_ts) ||
+      coerceThreadTs(obj?.thread_pane?.thread_ts) ||
+      coerceThreadTs(obj?.rightPane?.threadSidebar?.thread_ts);
 
     if (channelId && threadTs) {
       return { channelId, threadTs };
@@ -1198,7 +1470,10 @@ cat > preload.js <<'EOF'
       const nestedChannel =
         coerceChannelId(obj?.channel?.id) ||
         coerceChannelId(obj?.conversation?.id) ||
-        coerceChannelId(obj?.thread?.channel_id);
+        coerceChannelId(obj?.thread?.channel_id) ||
+        coerceChannelId(obj?.threadSidebar?.channel_id) ||
+        coerceChannelId(obj?.threadSidebar?.thread?.channel_id) ||
+        coerceChannelId(obj?.rightPane?.threadSidebar?.channel_id);
       if (nestedChannel) {
         return { channelId: nestedChannel, threadTs };
       }
@@ -1211,6 +1486,13 @@ cat > preload.js <<'EOF'
     const queue = [];
     const seen = new WeakSet();
     const candidates = gatherGlobalStateCandidates();
+
+    for (const candidate of candidates) {
+      const context = attemptExtractThreadContext(candidate);
+      if (context) {
+        return context;
+      }
+    }
 
     candidates.forEach((value) => {
       if (value && typeof value === 'object' && !seen.has(value)) {
@@ -1254,15 +1536,50 @@ cat > preload.js <<'EOF'
       }
     }
 
-    let context = deriveThreadContextFromDom();
+    let context = null;
+    let source = null;
+
+    const urlContext = threadContextFromUrl();
+    if (urlContext) {
+      context = urlContext;
+      source = 'url';
+    }
+
     if (!context) {
-      context = deriveThreadContextFromGlobals();
+      const domContext = deriveThreadContextFromDom();
+      if (domContext) {
+        context = domContext;
+        source = 'dom';
+      }
+    }
+
+    if (!context) {
+      const globalContext = deriveThreadContextFromGlobals();
+      if (globalContext) {
+        context = globalContext;
+        source = 'globals';
+      }
     }
 
     if (context) {
       cachedThreadContext = context;
       cachedThreadContextTimestamp = Date.now();
-      window.__slackAutocompleteThreadContext = context;
+      lastThreadContextSource = source;
+      lastThreadContextError = null;
+
+      const payload = {
+        ...context,
+        source,
+        updatedAt: cachedThreadContextTimestamp
+      };
+
+      window.__slackAutocompleteThreadContext = payload;
+      window.__slackAutocompleteThreadContextMeta = {
+        source,
+        updatedAt: cachedThreadContextTimestamp
+      };
+
+      log('Thread context refreshed', payload);
       return context;
     }
 
@@ -1271,12 +1588,18 @@ cat > preload.js <<'EOF'
       cachedThreadContextTimestamp = 0;
     }
 
+    lastThreadContextError = {
+      timestamp: Date.now(),
+      reason: 'context-not-found'
+    };
+
     return null;
   }
 
   function clearThreadContextCache() {
     cachedThreadContext = null;
     cachedThreadContextTimestamp = 0;
+     lastThreadContextSource = null;
   }
 
   function getThreadUrlFromContext(forceRefresh = false) {
@@ -1299,12 +1622,16 @@ cat > preload.js <<'EOF'
   function updateThreadButtonState(button) {
     if (!button) return;
     const hasUrl = Boolean(getThreadUrlFromContext(false));
-    button.disabled = !hasUrl;
-    button.setAttribute('aria-disabled', String(!hasUrl));
+    button.disabled = false;
+    button.setAttribute('aria-disabled', 'false');
     if (hasUrl) {
       button.classList.remove('c-button--disabled', 'is-disabled');
+      button.dataset.state = 'ready';
+      button.setAttribute('title', 'Open thread in new window');
     } else {
-      button.classList.add('c-button--disabled', 'is-disabled');
+      button.classList.remove('c-button--disabled', 'is-disabled');
+      button.dataset.state = 'searching';
+      button.setAttribute('title', 'Locating thread metadata…');
     }
   }
 
@@ -1357,12 +1684,14 @@ cat > preload.js <<'EOF'
 
       const threadUrl = getCurrentThreadUrl(true);
       if (!threadUrl) {
-        log('No thread URL detected; cannot open thread window.');
+        console.warn('[SlackAutocomplete] No thread URL detected; cannot open thread window.',
+          window.slackAutocomplete?.getThreadContext?.());
         updateThreadButtonState(button);
         return;
       }
 
       openSlackWindow(threadUrl);
+      log('Opening thread window', threadUrl);
     });
 
     anchor.appendChild(button);
@@ -1388,15 +1717,15 @@ cat > preload.js <<'EOF'
     }
     threadScanHandle = requestAnimationFrame(() => {
       threadScanHandle = null;
-      ensureThreadPopoutButton();
       refreshThreadContext(true);
+      ensureThreadPopoutButton();
       updateThreadButtonState(document.getElementById(THREAD_BUTTON_ID));
     });
   }
 
   function setupThreadWatcher() {
-    ensureThreadPopoutButton();
     refreshThreadContext(true);
+    ensureThreadPopoutButton();
     updateThreadButtonState(document.getElementById(THREAD_BUTTON_ID));
 
     if (threadObserver) {
@@ -1409,10 +1738,12 @@ cat > preload.js <<'EOF'
         for (const node of mutation.addedNodes) {
           if (!(node instanceof HTMLElement)) continue;
           if (
-            node.matches?.(THREAD_CONTAINER_SELECTORS.join(', ')) ||
-            node.querySelector?.(THREAD_CONTAINER_SELECTORS.join(', ')) ||
-            node.matches?.(THREAD_HEADER_SELECTORS.join(', ')) ||
-            node.querySelector?.(THREAD_HEADER_SELECTORS.join(', '))
+            node.matches?.(THREAD_CONTAINER_SELECTOR) ||
+            node.querySelector?.(THREAD_CONTAINER_SELECTOR) ||
+            node.matches?.(THREAD_HEADER_SELECTOR) ||
+            node.querySelector?.(THREAD_HEADER_SELECTOR) ||
+            node.matches?.(THREAD_MESSAGE_SELECTOR) ||
+            node.querySelector?.(THREAD_MESSAGE_SELECTOR)
           ) {
             scheduleThreadScan();
             return;
@@ -1436,6 +1767,7 @@ cat > preload.js <<'EOF'
     setupChannelContextMenuSupport();
     setupThreadWatcher();
     log('Slack autocomplete preload initialized.');
+    exposeDebugHelpers();
   }
 
   if (document.readyState === 'loading') {
