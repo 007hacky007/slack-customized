@@ -119,7 +119,16 @@ fi
 # main.js  (includes User-Agent override)
 # ---------------------------------------------------------------------------
 cat > main.js <<'EOF'
-const { app, BrowserWindow, session, nativeImage, ipcMain, shell } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  session,
+  nativeImage,
+  ipcMain,
+  shell,
+  Notification,
+  webContents
+} = require('electron');
 const fs = require('fs');
 const path = require('path');
 
@@ -145,6 +154,7 @@ const GPU_SWITCHES = [
   ['ignore-gpu-blocklist'],
   ['enable-features', 'Metal,CanvasOopRasterization']
 ];
+const ACTIVE_NOTIFICATIONS = new Map();
 
 GPU_SWITCHES.forEach(([name, value]) => {
   if (value) {
@@ -153,6 +163,19 @@ GPU_SWITCHES.forEach(([name, value]) => {
     app.commandLine.appendSwitch(name);
   }
 });
+
+function sendNotificationEvent(targetContentsId, payload) {
+  if (!targetContentsId) return;
+  const contents = webContents.fromId(targetContentsId);
+  if (!contents || contents.isDestroyed()) {
+    return;
+  }
+  try {
+    contents.send('slack-autocomplete:notification-event', payload);
+  } catch (err) {
+    console.warn('Failed to relay notification event to renderer', err);
+  }
+}
 
 function openExternalUrl(targetUrl) {
   if (!targetUrl) return;
@@ -375,6 +398,68 @@ ipcMain.handle('slack-autocomplete:open-window', async (_event, targetUrl) => {
   return { status: 'created' };
 });
 
+ipcMain.handle('slack-autocomplete:notify', async (event, payload = {}) => {
+  if (!Notification || !Notification.isSupported?.()) {
+    return { status: 'unsupported' };
+  }
+
+  const { title, options = {}, id } = payload;
+  if (typeof title !== 'string' || !title.trim()) {
+    return { status: 'error', reason: 'missing-title' };
+  }
+
+  const notificationOptions = {
+    title: title.trim(),
+    body: typeof options.body === 'string' ? options.body : '',
+    subtitle: typeof options.subtitle === 'string' ? options.subtitle : undefined,
+    silent: Boolean(options.silent),
+    urgency: options.urgency || 'normal',
+    timeoutType: options.requireInteraction ? 'never' : 'default',
+    icon: getIconImage()
+  };
+
+  const notification = new Notification(notificationOptions);
+  const contentsId = event.sender.id;
+  const key = `${contentsId}:${id}`;
+  ACTIVE_NOTIFICATIONS.set(key, notification);
+
+  notification.on('click', () => {
+    sendNotificationEvent(contentsId, { id, type: 'click' });
+    const contents = webContents.fromId(contentsId);
+    const win = contents ? BrowserWindow.fromWebContents(contents) : null;
+    if (win) {
+      if (win.isMinimized()) {
+        win.restore();
+      }
+      win.focus();
+    }
+  });
+
+  notification.on('close', () => {
+    sendNotificationEvent(contentsId, { id, type: 'close' });
+    ACTIVE_NOTIFICATIONS.delete(key);
+  });
+
+  try {
+    notification.show();
+    return { status: 'shown' };
+  } catch (err) {
+    console.warn('Failed to display notification:', err);
+    ACTIVE_NOTIFICATIONS.delete(key);
+    return { status: 'error', reason: 'show-failed' };
+  }
+});
+
+ipcMain.handle('slack-autocomplete:notification-close', async (event, id) => {
+  const key = `${event.sender.id}:${id}`;
+  const notification = ACTIVE_NOTIFICATIONS.get(key);
+  if (notification) {
+    notification.close();
+    ACTIVE_NOTIFICATIONS.delete(key);
+  }
+  return { status: 'closed' };
+});
+
 app.whenReady().then(() => {
   // Global default UA (covers auth popups etc.).
   session.defaultSession.setUserAgent(CHROME_UA);
@@ -458,6 +543,7 @@ cat > preload.js <<'EOF'
   let cachedThreadContextTimestamp = 0;
   let lastThreadContextSource = null;
   let lastThreadContextError = null;
+  let notificationBridgeInstalled = false;
 
   function log(...args) {
     if (!DEBUG) return;
@@ -479,6 +565,9 @@ cat > preload.js <<'EOF'
         refreshThreadContext(true);
         return api.getThreadContext();
       },
+      installNotifications() {
+        installNativeNotificationBridge();
+      },
       enableDebug() {
         try {
           window.localStorage.setItem('slackAutocompleteDebug', '1');
@@ -496,6 +585,101 @@ cat > preload.js <<'EOF'
     };
 
     window.slackAutocomplete = Object.freeze(api);
+  }
+
+  function emitNotificationEvent(instance, type) {
+    if (!instance) return;
+    const event = new Event(type);
+    instance.dispatchEvent(event);
+    const handler = instance[`on${type}`];
+    if (typeof handler === 'function') {
+      try {
+        handler.call(instance, event);
+      } catch (err) {
+        log('Notification handler error', err);
+      }
+    }
+  }
+
+  function installNativeNotificationBridge() {
+    if (notificationBridgeInstalled) return;
+    if (!ipcRenderer) return;
+    if (!window.Notification) return;
+
+    const notificationRegistry = new Map();
+
+    class SlackAutocompleteNotification extends EventTarget {
+      constructor(title = '', options = {}) {
+        super();
+        this.title = title;
+        this.options = options;
+        this.onclick = null;
+        this.onclose = null;
+        this.tag = options.tag || null;
+        this.data = options.data;
+        this.dir = options.dir || 'auto';
+        this.lang = options.lang || 'en';
+        this.silent = Boolean(options.silent);
+        this.renotify = Boolean(options.renotify);
+        this.requireInteraction = Boolean(options.requireInteraction);
+        this.timestamp = Date.now();
+        this.icon = options.icon || null;
+        this.badge = options.badge || null;
+        this.image = options.image || null;
+        this.__id = `${this.timestamp}-${Math.random().toString(16).slice(2)}`;
+
+        notificationRegistry.set(this.__id, this);
+
+        ipcRenderer
+          .invoke('slack-autocomplete:notify', {
+            id: this.__id,
+            title,
+            options: {
+              body: options.body || '',
+              silent: this.silent,
+              requireInteraction: this.requireInteraction,
+              subtitle: options.subtitle,
+              urgency: options.urgency,
+              tag: this.tag
+            }
+          })
+          .catch((err) => {
+            log('Failed to request native notification', err);
+          });
+      }
+
+      close() {
+        ipcRenderer
+          .invoke('slack-autocomplete:notification-close', this.__id)
+          .catch((err) => log('Failed to close native notification', err));
+        notificationRegistry.delete(this.__id);
+        emitNotificationEvent(this, 'close');
+      }
+
+      static requestPermission(callback) {
+        const result = 'granted';
+        if (typeof callback === 'function') {
+          callback(result);
+        }
+        return Promise.resolve(result);
+      }
+
+      static get permission() {
+        return 'granted';
+      }
+    }
+
+    window.Notification = SlackAutocompleteNotification;
+    notificationBridgeInstalled = true;
+
+    ipcRenderer.on('slack-autocomplete:notification-event', (_event, payload) => {
+      const instance = payload?.id ? notificationRegistry.get(payload.id) : null;
+      if (!instance) return;
+      emitNotificationEvent(instance, payload.type);
+      if (payload.type === 'close') {
+        notificationRegistry.delete(payload.id);
+      }
+    });
   }
 
   function isVisible(el) {
@@ -1811,6 +1995,7 @@ cat > preload.js <<'EOF'
     setupAutocompleteObservers();
     setupChannelContextMenuSupport();
     setupThreadWatcher();
+    installNativeNotificationBridge();
     log('Slack autocomplete preload initialized.');
     exposeDebugHelpers();
   }
