@@ -849,6 +849,25 @@ cat > preload.js <<'EOF'
     );
   }
 
+  function attachMouseListener() {
+    document.addEventListener(
+      'mousemove',
+      (ev) => {
+        if (!ev.isTrusted) return;
+        if (!allowAutoSelect) return;
+
+        if (ev.target instanceof Element) {
+          const listbox = ev.target.closest('[role="listbox"]');
+          if (listbox) {
+            allowAutoSelect = false;
+            log('User mouse interaction detected in listbox; disabling auto-select.');
+          }
+        }
+      },
+      true
+    );
+  }
+
   function fallbackWindowOpen(url) {
     try {
       window.open(url, '_blank', 'noopener');
@@ -1992,6 +2011,7 @@ cat > preload.js <<'EOF'
 
   function init() {
     attachKeyListener();
+    attachMouseListener();
     setupAutocompleteObservers();
     setupChannelContextMenuSupport();
     setupThreadWatcher();
