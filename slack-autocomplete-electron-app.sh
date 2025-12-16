@@ -460,6 +460,15 @@ ipcMain.handle('slack-autocomplete:notification-close', async (event, id) => {
   return { status: 'closed' };
 });
 
+ipcMain.handle('slack-autocomplete:update-badge', (_event, text) => {
+  if (process.platform === 'darwin' && app.dock) {
+    // Ensure text is a string
+    const badgeText = typeof text === 'string' ? text : '';
+    app.dock.setBadge(badgeText);
+  }
+  return { status: 'ok' };
+});
+
 app.whenReady().then(() => {
   // Global default UA (covers auth popups etc.).
   session.defaultSession.setUserAgent(CHROME_UA);
@@ -2009,12 +2018,54 @@ cat > preload.js <<'EOF'
     document.addEventListener('keyup', scheduleThreadScan, true);
   }
 
+  function setupBadgeUpdater() {
+    const updateBadge = () => {
+      const title = document.title;
+      let badge = '';
+
+      // 1. Check for " - N new items - Slack" suffix (User reported format)
+      const suffixMatch = title.match(/-\s*(\d+)\s*new\s*items?\s*-\s*Slack\s*$/i);
+
+      // 2. Check for "(N)" prefix (Standard Slack mentions)
+      const prefixMatch = title.match(/^\((\d+)\)/);
+
+      if (suffixMatch) {
+        badge = suffixMatch[1];
+      } else if (prefixMatch) {
+        badge = prefixMatch[1];
+      } else if (title.startsWith('!') || title.startsWith('*')) {
+        // 3. Fallback for unread activity without count
+        badge = '•';
+      }
+
+      if (ipcRenderer) {
+        ipcRenderer.invoke('slack-autocomplete:update-badge', badge).catch((err) => {
+          log('Failed to update badge', err);
+        });
+      }
+    };
+
+    const titleEl = document.querySelector('title');
+    if (titleEl) {
+      const observer = new MutationObserver(updateBadge);
+      observer.observe(titleEl, {
+        childList: true,
+        characterData: true,
+        subtree: true
+      });
+    }
+
+    // Initial check
+    updateBadge();
+  }
+
   function init() {
     attachKeyListener();
     attachMouseListener();
     setupAutocompleteObservers();
     setupChannelContextMenuSupport();
     setupThreadWatcher();
+    setupBadgeUpdater();
     installNativeNotificationBridge();
     log('Slack autocomplete preload initialized.');
     exposeDebugHelpers();
