@@ -127,7 +127,9 @@ const {
   ipcMain,
   shell,
   Notification,
-  webContents
+  webContents,
+  Menu,
+  dialog
 } = require('electron');
 const fs = require('fs');
 const path = require('path');
@@ -155,6 +157,7 @@ const GPU_SWITCHES = [
   ['enable-features', 'Metal,CanvasOopRasterization']
 ];
 const ACTIVE_NOTIFICATIONS = new Map();
+const IS_MAC = process.platform === 'darwin';
 
 GPU_SWITCHES.forEach(([name, value]) => {
   if (value) {
@@ -184,6 +187,173 @@ function openExternalUrl(targetUrl) {
   } catch (err) {
     console.warn('Failed to open external URL:', targetUrl, err);
   }
+}
+
+function buildClearCacheMenuItems() {
+  const configs = [
+    {
+      label: 'Clear Cache (Keep Login)',
+      accelerator: 'CmdOrCtrl+Shift+K',
+      preserveSession: true
+    },
+    {
+      label: 'Clear Cache (Full Reset)',
+      accelerator: 'CmdOrCtrl+Shift+Delete',
+      preserveSession: false
+    }
+  ];
+
+  return configs.map(({ label, accelerator, preserveSession }) => ({
+    label,
+    accelerator,
+    click: (_menuItem, browserWindow) => {
+      clearAppCache(browserWindow, { preserveSession, label });
+    }
+  }));
+}
+
+async function clearAppCache(targetWindow, options = {}) {
+  const { preserveSession = false, label = 'Cache' } = options;
+  const browserWindow =
+    targetWindow && !targetWindow.isDestroyed() ? targetWindow : BrowserWindow.getFocusedWindow();
+
+  try {
+    const defaultSession = session.defaultSession;
+    if (defaultSession) {
+      await defaultSession.clearCache();
+      if (!preserveSession) {
+        await defaultSession.clearStorageData();
+      }
+    }
+
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win || win.isDestroyed()) {
+        return;
+      }
+      try {
+        win.webContents.reloadIgnoringCache();
+      } catch (err) {
+        console.warn('Failed to reload window after cache clear', err);
+      }
+    });
+
+    if (dialog && typeof dialog.showMessageBox === 'function') {
+      dialog.showMessageBox(browserWindow || null, {
+        type: 'info',
+        message: `${label} Cleared`,
+        detail: preserveSession
+          ? 'Cached assets were purged while keeping your Slack login session.'
+          : 'Cached assets and local storage were purged; you may need to log back in.',
+        buttons: ['OK']
+      });
+    }
+  } catch (err) {
+    console.warn('Failed to clear cache:', err);
+    if (dialog && typeof dialog.showMessageBox === 'function') {
+      dialog.showMessageBox(browserWindow || null, {
+        type: 'error',
+        message: 'Unable to Clear Cache',
+        detail: err?.message || 'Check the logs for details.',
+        buttons: ['OK']
+      });
+    }
+  }
+}
+
+function installApplicationMenu() {
+  if (!Menu || typeof Menu.buildFromTemplate !== 'function') {
+    return;
+  }
+
+  const template = [
+    ...(IS_MAC
+      ? [
+          {
+            label: app.name,
+            submenu: [
+              { role: 'about' },
+              { type: 'separator' },
+              ...buildClearCacheMenuItems(),
+              { type: 'separator' },
+              { role: 'services' },
+              { type: 'separator' },
+              { role: 'hide' },
+              { role: 'hideOthers' },
+              { role: 'unhide' },
+              { type: 'separator' },
+              { role: 'quit' }
+            ]
+          }
+        ]
+      : []),
+    {
+      label: 'File',
+      submenu: [
+        ...buildClearCacheMenuItems(),
+        { type: 'separator' },
+        IS_MAC ? { role: 'close' } : { role: 'quit' }
+      ]
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        ...(IS_MAC
+          ? [
+              { role: 'pasteAndMatchStyle' },
+              { role: 'delete' },
+              { role: 'selectAll' },
+              { type: 'separator' },
+              {
+                label: 'Speech',
+                submenu: [{ role: 'startspeaking' }, { role: 'stopspeaking' }]
+              }
+            ]
+          : [{ role: 'delete' }, { type: 'separator' }, { role: 'selectAll' }])
+      ]
+    },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'reload' },
+        { role: 'forcereload' },
+        { role: 'toggledevtools' },
+        { type: 'separator' },
+        { role: 'resetzoom' },
+        { role: 'zoomin' },
+        { role: 'zoomout' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' }
+      ]
+    },
+    {
+      label: 'Window',
+      submenu: [
+        { role: 'minimize' },
+        { role: 'zoom' },
+        ...(IS_MAC
+          ? [{ type: 'separator' }, { role: 'front' }, { role: 'window' }]
+          : [{ role: 'close' }])
+      ]
+    },
+    {
+      role: 'help',
+      submenu: [
+        {
+          label: 'Learn More',
+          click: () => openExternalUrl('https://slack.com/help/categories/360000049423')
+        }
+      ]
+    }
+  ];
+
+  const menu = Menu.buildFromTemplate(template);
+  Menu.setApplicationMenu(menu);
 }
 
 function isSlackUrl(targetUrl) {
@@ -472,6 +642,7 @@ ipcMain.handle('slack-autocomplete:update-badge', (_event, text) => {
 app.whenReady().then(() => {
   // Global default UA (covers auth popups etc.).
   session.defaultSession.setUserAgent(CHROME_UA);
+  installApplicationMenu();
 
   const dockIcon = getIconImage();
   if (dockIcon && app.dock) {
@@ -2100,4 +2271,7 @@ echo
 echo "For dev mode instead of the packaged .app:"
 echo "  cd \"$APP_DIR\""
 echo "  npm start"
+echo
+echo "Use \"Clear Cache (Keep Login)\" in the menubar to refresh Slack without signing out."
+echo "Use \"Clear Cache (Full Reset)\" for a complete reset if things are really wedged."
 
