@@ -279,7 +279,11 @@ function focusOrCreateWindow(targetUrl = SLACK_URL) {
 
   if (first) {
     try {
-      first.loadURL(normalized);
+      // Prefer sending a soft navigation to the existing renderer to avoid full reloads.
+      const routed = routeUrlInWindow(first, normalized);
+      if (!routed) {
+        first.loadURL(normalized);
+      }
       if (first.isMinimized()) {
         first.restore();
       }
@@ -695,6 +699,20 @@ function applyWindowPolicies(win) {
       openExternalUrl(url);
     }
   });
+}
+
+function routeUrlInWindow(win, targetUrl) {
+  if (!win || win.isDestroyed()) {
+    return false;
+  }
+
+  try {
+    win.webContents.send('slack-autocomplete:open-url', targetUrl);
+    return true;
+  } catch (err) {
+    console.warn('Failed to send soft navigation; will fall back to loadURL', err);
+    return false;
+  }
 }
 
 function registerProtocolHandler() {
@@ -1267,6 +1285,16 @@ cat > preload.js <<'EOF'
 
     fallbackWindowOpen(url);
   }
+
+  ipcRenderer?.on('slack-autocomplete:open-url', (_event, targetUrl) => {
+    if (typeof targetUrl !== 'string') return;
+    if (window.location.href === targetUrl) return;
+    try {
+      window.location.href = targetUrl;
+    } catch (err) {
+      log('Failed to navigate to target URL', targetUrl, err);
+    }
+  });
 
   function closeContextMenus() {
     const eventInit = {
