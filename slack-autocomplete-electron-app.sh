@@ -4,6 +4,7 @@ set -euo pipefail
 APP_NAME="SlackAutocompleteElectron"
 APP_DIR="$HOME/$APP_NAME"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUNDLE_ID="com.example.slack-autocomplete-electron"
 
 ICON_SOURCE="$SCRIPT_DIR/wired-flat-2648-logo-circle-slack.svg"
 ICONSET_DIR="$APP_DIR/AppIcon.iconset"
@@ -144,6 +145,7 @@ const CHROME_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
   'AppleWebKit/537.36 (KHTML, like Gecko) ' +
   'Chrome/131.0.0.0 Safari/537.36';
+const REGISTERED_PROTOCOL = 'slack';
 const ICON_FILENAME = 'AppIcon.icns';
 let cachedIconImage;
 let windowStateFilePath;
@@ -159,6 +161,7 @@ const GPU_SWITCHES = [
 const ACTIVE_NOTIFICATIONS = new Map();
 const IS_MAC = process.platform === 'darwin';
 let isQuitting = false;
+const pendingDeepLinks = [];
 
 GPU_SWITCHES.forEach(([name, value]) => {
   if (value) {
@@ -167,6 +170,30 @@ GPU_SWITCHES.forEach(([name, value]) => {
     app.commandLine.appendSwitch(name);
   }
 });
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+  process.exit(0);
+}
+
+collectDeepLinksFromArgv(process.argv).forEach(enqueueDeepLink);
+
+app.on('second-instance', (_event, argv) => {
+  const links = collectDeepLinksFromArgv(argv);
+  if (links.length) {
+    links.forEach(enqueueDeepLink);
+  } else {
+    showAllWindows();
+  }
+});
+
+if (IS_MAC) {
+  app.on('open-url', (event, url) => {
+    event.preventDefault();
+    enqueueDeepLink(url);
+  });
+}
 
 function sendNotificationEvent(targetContentsId, payload) {
   if (!targetContentsId) return;
@@ -187,6 +214,129 @@ function openExternalUrl(targetUrl) {
     shell.openExternal(targetUrl);
   } catch (err) {
     console.warn('Failed to open external URL:', targetUrl, err);
+  }
+}
+
+function collectDeepLinksFromArgv(argv = []) {
+  return argv.filter((arg) => typeof arg === 'string' && arg.startsWith(`${REGISTERED_PROTOCOL}://`));
+}
+
+function normalizeSlackDeepLink(targetUrl) {
+  try {
+    const url = new URL(targetUrl);
+    if (url.protocol !== `${REGISTERED_PROTOCOL}:`) {
+      return null;
+    }
+
+    const host = (url.hostname || url.host || '').toLowerCase();
+    const params = url.searchParams;
+    const team = params.get('team') || params.get('team_id');
+    const channel =
+      params.get('id') ||
+      params.get('channel') ||
+      params.get('channel_id') ||
+      params.get('conversation');
+    const threadTs =
+      params.get('thread_ts') ||
+      params.get('message') ||
+      params.get('msg') ||
+      params.get('ts');
+
+    // Handle common Slack deep link shapes: slack://channel?... or slack://open?... .
+    if (!team && !channel) {
+      return SLACK_URL;
+    }
+
+    let target = `${SLACK_URL}`;
+    if (team) {
+      target += `/${team}`;
+    }
+
+    if (channel) {
+      target += `/${channel}`;
+    }
+
+    if (threadTs && channel) {
+      target += `/thread/${channel}-${threadTs}`;
+    }
+
+    // Preserve unknown hosts but still route into the web client.
+    if (host === 'app' && params.get('id')) {
+      target += `/app/${params.get('id')}`;
+    }
+
+    return target;
+  } catch (err) {
+    console.warn('Failed to parse slack deep link', targetUrl, err);
+    return null;
+  }
+}
+
+function focusOrCreateWindow(targetUrl = SLACK_URL) {
+  const normalized = isSlackUrl(targetUrl) ? targetUrl : SLACK_URL;
+  const windows = BrowserWindow.getAllWindows().filter((win) => win && !win.isDestroyed());
+  const first = windows[0];
+
+  if (first) {
+    try {
+      first.loadURL(normalized);
+      if (first.isMinimized()) {
+        first.restore();
+      }
+      first.show();
+      first.focus();
+      return first;
+    } catch (err) {
+      console.warn('Failed to route deep link to existing window', err);
+    }
+  }
+
+  return createWindow(normalized);
+}
+
+function showAllWindows() {
+  const windows = BrowserWindow.getAllWindows().filter((win) => win && !win.isDestroyed());
+  if (windows.length === 0) {
+    createWindow();
+    return;
+  }
+
+  windows.forEach((win) => {
+    try {
+      if (win.isMinimized && win.isMinimized()) {
+        win.restore();
+      }
+
+      if (win.showInactive) {
+        win.showInactive();
+      } else if (typeof win.isVisible === 'function' ? !win.isVisible() : true) {
+        win.show();
+      }
+
+      win.focus();
+    } catch (err) {
+      console.warn('Failed to re-show window', err);
+    }
+  });
+}
+
+function handleDeepLink(targetUrl) {
+  const webUrl = normalizeSlackDeepLink(targetUrl) || SLACK_URL;
+  focusOrCreateWindow(webUrl);
+}
+
+function enqueueDeepLink(url) {
+  if (!url || typeof url !== 'string') return;
+  pendingDeepLinks.push(url);
+  if (app.isReady()) {
+    processPendingDeepLinks();
+  }
+}
+
+function processPendingDeepLinks() {
+  while (pendingDeepLinks.length) {
+    const link = pendingDeepLinks.shift();
+    handleDeepLink(link);
   }
 }
 
@@ -547,6 +697,19 @@ function applyWindowPolicies(win) {
   });
 }
 
+function registerProtocolHandler() {
+  try {
+    if (process.defaultApp) {
+      const target = process.argv[1] ? path.resolve(process.argv[1]) : undefined;
+      app.setAsDefaultProtocolClient(REGISTERED_PROTOCOL, process.execPath, target ? [target] : undefined);
+    } else {
+      app.setAsDefaultProtocolClient(REGISTERED_PROTOCOL);
+    }
+  } catch (err) {
+    console.warn('Failed to register protocol handler', err);
+  }
+}
+
 function installHideOnClose(win) {
   if (!win || win.__slackHidePatch) {
     return;
@@ -675,6 +838,7 @@ ipcMain.handle('slack-autocomplete:update-badge', (_event, text) => {
 app.whenReady().then(() => {
   // Global default UA (covers auth popups etc.).
   session.defaultSession.setUserAgent(CHROME_UA);
+  registerProtocolHandler();
   installApplicationMenu();
 
   const dockIcon = getIconImage();
@@ -686,30 +850,10 @@ app.whenReady().then(() => {
   const urlsToOpen = initialWindows.length ? initialWindows : [SLACK_URL];
   urlsToOpen.forEach((url) => createWindow(url));
 
+  processPendingDeepLinks();
+
   app.on('activate', () => {
-    const windows = BrowserWindow.getAllWindows().filter((win) => win && !win.isDestroyed());
-    if (windows.length === 0) {
-      createWindow();
-      return;
-    }
-
-    windows.forEach((win) => {
-      try {
-        if (win.isMinimized && win.isMinimized()) {
-          win.restore();
-        }
-
-        if (win.showInactive) {
-          win.showInactive();
-        } else if (typeof win.isVisible === 'function' ? !win.isVisible() : true) {
-          win.show();
-        }
-
-        win.focus();
-      } catch (err) {
-        console.warn('Failed to re-show window on activate', err);
-      }
-    });
+    showAllWindows();
   });
 });
 
@@ -2313,7 +2457,15 @@ if [[ -f "$APP_ICON" ]]; then
 fi
 
 echo "Packaging macOS app with electron-packager..."
-npx electron-packager . "$APP_NAME" --platform=darwin --arch="$EP_ARCH" --out=dist --overwrite "${ICON_ARGS[@]}" > /dev/null
+npx electron-packager . "$APP_NAME" \
+  --platform=darwin \
+  --arch="$EP_ARCH" \
+  --out=dist \
+  --overwrite \
+  --app-bundle-id="$BUNDLE_ID" \
+  --protocol=slack \
+  --protocol-name="Slack URL" \
+  "${ICON_ARGS[@]}" > /dev/null
 
 APP_PATH="$APP_DIR/dist/${APP_NAME}-darwin-${EP_ARCH}/${APP_NAME}.app"
 
