@@ -158,6 +158,7 @@ const GPU_SWITCHES = [
 ];
 const ACTIVE_NOTIFICATIONS = new Map();
 const IS_MAC = process.platform === 'darwin';
+let isQuitting = false;
 
 GPU_SWITCHES.forEach(([name, value]) => {
   if (value) {
@@ -546,9 +547,41 @@ function applyWindowPolicies(win) {
   });
 }
 
+function installHideOnClose(win) {
+  if (!win || win.__slackHidePatch) {
+    return;
+  }
+
+  win.__slackHidePatch = true;
+
+  win.on('close', (event) => {
+    if (isQuitting || win.isDestroyed()) {
+      return;
+    }
+
+    event.preventDefault();
+
+    try {
+      if (win.isFullScreen && win.isFullScreen()) {
+        win.setFullScreen(false);
+      }
+
+      if (win.isMinimized && win.isMinimized()) {
+        win.restore();
+      }
+
+      win.hide();
+      scheduleWindowStateSave();
+    } catch (err) {
+      console.warn('Failed to hide window on close', err);
+    }
+  });
+}
+
 function createWindow(initialUrl = SLACK_URL) {
   const win = new BrowserWindow(buildWindowOptions());
   applyWindowPolicies(win);
+  installHideOnClose(win);
   win.loadURL(initialUrl);
   attachWindowStateTracking(win, initialUrl);
   return win;
@@ -654,18 +687,40 @@ app.whenReady().then(() => {
   urlsToOpen.forEach((url) => createWindow(url));
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
+    const windows = BrowserWindow.getAllWindows().filter((win) => win && !win.isDestroyed());
+    if (windows.length === 0) {
       createWindow();
+      return;
     }
+
+    windows.forEach((win) => {
+      try {
+        if (win.isMinimized && win.isMinimized()) {
+          win.restore();
+        }
+
+        if (win.showInactive) {
+          win.showInactive();
+        } else if (typeof win.isVisible === 'function' ? !win.isVisible() : true) {
+          win.show();
+        }
+
+        win.focus();
+      } catch (err) {
+        console.warn('Failed to re-show window on activate', err);
+      }
+    });
   });
 });
 
 app.on('browser-window-created', (_event, window) => {
   applyWindowPolicies(window);
   attachWindowStateTracking(window);
+  installHideOnClose(window);
 });
 
 app.on('before-quit', () => {
+  isQuitting = true;
   saveWindowStateNow();
 });
 
