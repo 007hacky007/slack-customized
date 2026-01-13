@@ -429,6 +429,11 @@ function installApplicationMenu() {
               { role: 'about' },
               { type: 'separator' },
               ...buildClearCacheMenuItems(),
+              {
+                label: 'Reset Window State',
+                accelerator: 'CmdOrCtrl+Shift+R',
+                click: () => resetWindowState()
+              },
               { type: 'separator' },
               { role: 'services' },
               { type: 'separator' },
@@ -445,6 +450,11 @@ function installApplicationMenu() {
       label: 'File',
       submenu: [
         ...buildClearCacheMenuItems(),
+        {
+          label: 'Reset Window State',
+          accelerator: 'CmdOrCtrl+Shift+R',
+          click: () => resetWindowState()
+        },
         { type: 'separator' },
         IS_MAC ? { role: 'close' } : { role: 'quit' }
       ]
@@ -624,6 +634,62 @@ function saveWindowStateNow() {
     fs.writeFileSync(filePath, JSON.stringify(urls, null, 2), 'utf8');
   } catch (err) {
     console.warn('Failed to persist window state:', err);
+  }
+}
+
+function resetWindowState() {
+  const filePath = getWindowStateFilePath();
+  let deleted = false;
+
+  try {
+    if (windowStateSaveTimer) {
+      clearTimeout(windowStateSaveTimer);
+      windowStateSaveTimer = null;
+    }
+
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      deleted = true;
+    }
+  } catch (err) {
+    console.warn('Failed to delete window state file:', err);
+  }
+
+  const windows = BrowserWindow.getAllWindows().filter((win) => win && !win.isDestroyed());
+  const primary = windows[0];
+
+  windows.slice(1).forEach((win) => {
+    try {
+      win.destroy();
+    } catch (err) {
+      console.warn('Failed to close extra window during reset', err);
+    }
+  });
+
+  try {
+    if (primary && !primary.isDestroyed()) {
+      primary.__slackLastUrl = SLACK_URL;
+      primary.loadURL(SLACK_URL);
+      primary.show();
+      primary.focus();
+    } else {
+      createWindow(SLACK_URL);
+    }
+  } catch (err) {
+    console.warn('Failed to reload primary window during reset', err);
+  }
+
+  if (dialog && typeof dialog.showMessageBox === 'function') {
+    const detail = deleted
+      ? `Removed window state file at: ${filePath}`
+      : `No window state file was found at: ${filePath}`;
+
+    dialog.showMessageBox(primary || null, {
+      type: 'info',
+      message: 'Window state has been reset',
+      detail,
+      buttons: ['OK']
+    });
   }
 }
 
