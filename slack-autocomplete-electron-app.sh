@@ -144,7 +144,7 @@ const SLACK_URL = process.env.SLACK_URL || 'https://app.slack.com/client';
 const CHROME_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
   'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-  'Chrome/131.0.0.0 Safari/537.36';
+  'Chrome/142.0.7444.235 Safari/537.36';
 const REGISTERED_PROTOCOL = 'slack';
 const ICON_FILENAME = 'AppIcon.icns';
 let cachedIconImage;
