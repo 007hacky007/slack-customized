@@ -745,18 +745,34 @@ function buildWindowOptions() {
   };
 }
 
+function triggerDownload(url) {
+  if (!url) return;
+  const windows = BrowserWindow.getAllWindows().filter((w) => w && !w.isDestroyed());
+  const target = windows[0] || createWindow(SLACK_URL);
+  try {
+    target.webContents.downloadURL(url);
+  } catch (err) {
+    console.warn('Failed to start download for', url, err);
+  }
+}
+
 function applyWindowPolicies(win) {
   win.webContents.session.setUserAgent(CHROME_UA);
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    if (!isSlackUrl(url)) {
-      openExternalUrl(url);
+  win.webContents.setWindowOpenHandler(({ url, disposition }) => {
+    // Downloads that try to open a new window get routed to download manager instead of spawning a window.
+    if (disposition === 'save-to-disk') {
+      triggerDownload(url);
       return { action: 'deny' };
     }
 
-    return {
-      action: 'allow',
-      overrideBrowserWindowOptions: buildWindowOptions()
-    };
+    if (isSlackUrl(url)) {
+      focusOrCreateWindow(url);
+      return { action: 'deny' };
+    }
+
+    // Non-Slack URLs: open in system browser, never inside the app.
+    openExternalUrl(url);
+    return { action: 'deny' };
   });
 
   win.webContents.on('will-navigate', (event, url) => {
