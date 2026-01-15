@@ -935,6 +935,43 @@ ipcMain.handle('slack-autocomplete:update-badge', (_event, text) => {
   return { status: 'ok' };
 });
 
+ipcMain.handle('slack-autocomplete:context-menu', (event, payload = {}) => {
+  const browserWindow = BrowserWindow.fromWebContents(event.sender);
+  if (!browserWindow) {
+    return { status: 'no-window' };
+  }
+
+  const { selectionText = '', isEditable = false, hasSelection = false } = payload;
+  const template = [];
+
+  if (isEditable) {
+    template.push({ role: 'cut' });
+  }
+
+  if (hasSelection || selectionText) {
+    template.push({ role: 'copy' });
+  }
+
+  if (isEditable) {
+    template.push({ role: 'paste' }, { role: 'selectAll' });
+  } else {
+    template.push({ role: 'selectAll' });
+  }
+
+  if (!template.length) {
+    return { status: 'no-items' };
+  }
+
+  try {
+    const menu = Menu.buildFromTemplate(template);
+    menu.popup({ window: browserWindow, positioningItem: 0 });
+    return { status: 'shown' };
+  } catch (err) {
+    console.warn('Failed to show context menu:', err);
+    return { status: 'error' };
+  }
+});
+
 app.whenReady().then(() => {
   // Global default UA (covers auth popups etc.).
   session.defaultSession.setUserAgent(CHROME_UA);
@@ -1325,6 +1362,44 @@ cat > preload.js <<'EOF'
         }
       },
       true
+    );
+  }
+
+  function isEditableTarget(node) {
+    if (!(node instanceof Element)) return false;
+    if (node.closest('input, textarea, [contenteditable="true"], [contenteditable=""]')) {
+      return true;
+    }
+    const role = node.getAttribute('role');
+    return role === 'textbox' || role === 'combobox' || role === 'searchbox';
+  }
+
+  function setupNativeContextMenu() {
+    document.addEventListener(
+      'contextmenu',
+      (event) => {
+        try {
+          const selection = window.getSelection ? window.getSelection() : null;
+          const selectionText = selection ? String(selection).trim() : '';
+          const isEditable = isEditableTarget(event.target);
+          const hasSelection = Boolean(selectionText);
+
+          if (!isEditable && !hasSelection) {
+            return;
+          }
+
+          event.preventDefault();
+
+          ipcRenderer?.invoke('slack-autocomplete:context-menu', {
+            selectionText,
+            hasSelection,
+            isEditable
+          });
+        } catch (err) {
+          log('Context menu error', err);
+        }
+      },
+      false
     );
   }
 
@@ -2542,6 +2617,7 @@ cat > preload.js <<'EOF'
   function init() {
     attachKeyListener();
     attachMouseListener();
+    setupNativeContextMenu();
     setupAutocompleteObservers();
     setupChannelContextMenuSupport();
     setupThreadWatcher();
