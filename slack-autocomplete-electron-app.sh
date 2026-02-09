@@ -822,6 +822,13 @@ function installHideOnClose(win) {
       return;
     }
 
+    // Let secondary windows actually close so window-state.json stays accurate.
+    const openWindows = BrowserWindow.getAllWindows().filter((w) => w && !w.isDestroyed());
+    const hasOtherWindows = openWindows.some((w) => w !== win);
+    if (hasOtherWindows) {
+      return;
+    }
+
     event.preventDefault();
 
     try {
