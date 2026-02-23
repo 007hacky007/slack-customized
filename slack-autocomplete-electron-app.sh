@@ -948,8 +948,29 @@ ipcMain.handle('slack-autocomplete:context-menu', (event, payload = {}) => {
     return { status: 'no-window' };
   }
 
-  const { selectionText = '', isEditable = false, hasSelection = false } = payload;
+  const contents = event.sender;
+  const { selectionText = '', isEditable = false, hasSelection = false, canGoBack: rendererCanGoBack = false } = payload;
   const template = [];
+
+  const canGoBack = Boolean(rendererCanGoBack) || (contents && contents.canGoBack && contents.canGoBack());
+
+  template.push({
+    label: 'Go Back',
+    accelerator: 'Esc',
+    enabled: canGoBack,
+    click: () => {
+      if (!canGoBack) return;
+      try {
+        if (contents && contents.canGoBack && contents.canGoBack()) {
+          contents.goBack();
+        } else {
+          contents?.send('slack-autocomplete:attachment-go-back');
+        }
+      } catch (err) {
+        console.warn('Failed to go back from context menu', err);
+      }
+    }
+  }, { type: 'separator' });
 
   if (isEditable) {
     template.push({ role: 'cut' });
@@ -1053,6 +1074,8 @@ cat > preload.js <<'EOF'
   const THREAD_BUTTON_WRAPPER_ID = 'slack-autocomplete-thread-popout-wrapper';
   const CHANNEL_MENU_ITEM_QA = 'slack_autocomplete_open_window';
   const CHANNEL_MENU_SEPARATOR_QA = 'slack_autocomplete_open_window_separator';
+  const ATTACHMENT_EXIT_ID = 'slack-autocomplete-attachment-exit';
+  const LAST_MAIN_URL_KEY = 'slackAutocompleteLastMainUrl';
 
   let allowAutoSelect = true;
   let pendingChannelContext = null;
@@ -1390,17 +1413,17 @@ cat > preload.js <<'EOF'
           const selectionText = selection ? String(selection).trim() : '';
           const isEditable = isEditableTarget(event.target);
           const hasSelection = Boolean(selectionText);
+          const canGoBack = true; // Always expose Go Back in menu; enable/disable in main process.
 
-          if (!isEditable && !hasSelection) {
-            return;
-          }
+          // Always allow opening to show Go Back even if no text selection.
 
           event.preventDefault();
 
           ipcRenderer?.invoke('slack-autocomplete:context-menu', {
             selectionText,
             hasSelection,
-            isEditable
+            isEditable,
+            canGoBack
           });
         } catch (err) {
           log('Context menu error', err);
@@ -1754,6 +1777,178 @@ cat > preload.js <<'EOF'
       childList: true,
       subtree: true
     });
+  }
+
+  let lastMainUrl = (() => {
+    try {
+      return window.sessionStorage.getItem(LAST_MAIN_URL_KEY) || null;
+    } catch (err) {
+      return null;
+    }
+  })();
+
+  function rememberMainUrl(url) {
+    if (!url) return;
+    lastMainUrl = url;
+    try {
+      window.sessionStorage.setItem(LAST_MAIN_URL_KEY, url);
+    } catch (err) {
+      log('Unable to persist last main URL', err);
+    }
+  }
+
+  function isSlackClientRoute(targetUrl) {
+    try {
+      const u = new URL(targetUrl);
+      return u.hostname.endsWith('slack.com') && u.pathname.includes('/client/');
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function isLikelyAttachmentRoute(targetUrl) {
+    try {
+      const u = new URL(targetUrl);
+      const segments = u.pathname.split('/').filter(Boolean);
+      const clientIdx = segments.indexOf('client');
+      const afterClient = clientIdx >= 0 ? segments.slice(clientIdx + 2) : segments;
+      const markers = ['file', 'files', 'file-upload', 'file_upload', 'notes', 'downloads'];
+      if (afterClient.some((part) => markers.includes(part))) {
+        return true;
+      }
+
+      if (u.searchParams.get('file') || u.searchParams.get('attachment') || u.searchParams.get('raw')) {
+        return true;
+      }
+    } catch (err) {
+      /* ignore parse issues */
+    }
+
+    return Boolean(
+      document.querySelector(
+        '.p-file_viewer, .p-file_viewer_modal, [data-qa="file_viewer"], [data-qa="file_viewer_root"], [data-qa="file_preview_body"], [data-qa="file_title"]'
+      )
+    );
+  }
+
+  function isNativeSlackFileViewerOpen() {
+    const selectors = [
+      '.p-file_viewer',
+      '.p-file_viewer_modal',
+      '.c-lightbox__container',
+      '[data-qa="file_viewer"]',
+      '[data-qa="file_viewer_root"]',
+      '[data-qa="file_preview_body"]',
+      '[data-qa="file_title"]'
+    ];
+
+    return selectors.some((selector) => {
+      const el = document.querySelector(selector);
+      return el && isVisible(el);
+    });
+  }
+
+  function isLikelyMainClientRoute(targetUrl) {
+    return isSlackClientRoute(targetUrl) && !isLikelyAttachmentRoute(targetUrl);
+  }
+
+  function goBackFromAttachment() {
+    const target = lastMainUrl || `${window.location.origin}/client`;
+
+    if (window.history.length > 1) {
+      window.history.back();
+      setTimeout(() => {
+        if (isLikelyAttachmentRoute(window.location.href) && target) {
+          window.location.href = target;
+        }
+      }, 400);
+      return;
+    }
+
+    if (target) {
+      window.location.href = target;
+    }
+  }
+
+  function renderAttachmentExitButton() {
+    const shouldShow = isLikelyAttachmentRoute(window.location.href);
+    const existing = document.getElementById(ATTACHMENT_EXIT_ID);
+
+    if (!shouldShow) {
+      existing?.remove();
+      return;
+    }
+
+    if (existing) return;
+
+    const button = document.createElement('button');
+    button.id = ATTACHMENT_EXIT_ID;
+    button.type = 'button';
+    button.textContent = 'X';
+    button.setAttribute('aria-label', 'Close attachment');
+    button.setAttribute('title', 'Back to Slack');
+
+    Object.assign(button.style, {
+      position: 'fixed',
+      top: '12px',
+      right: '12px',
+      width: '32px',
+      height: '32px',
+      borderRadius: '16px',
+      border: '1px solid rgba(0, 0, 0, 0.2)',
+      background: '#fff',
+      color: '#1d1c1d',
+      fontSize: '18px',
+      lineHeight: '32px',
+      textAlign: 'center',
+      boxShadow: '0 6px 18px rgba(0, 0, 0, 0.16)',
+      zIndex: '99999',
+      cursor: 'pointer',
+      padding: '0'
+    });
+
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      goBackFromAttachment();
+    });
+
+    document.body.appendChild(button);
+  }
+
+  function handleAttachmentState() {
+    const href = window.location.href;
+    if (isLikelyMainClientRoute(href)) {
+      rememberMainUrl(href);
+    }
+    renderAttachmentExitButton();
+  }
+
+  function setupAttachmentEscape() {
+    handleAttachmentState();
+
+    window.addEventListener('hashchange', handleAttachmentState);
+    window.addEventListener('popstate', handleAttachmentState);
+
+    window.addEventListener(
+      'keydown',
+      (ev) => {
+        if (ev.key === 'Escape' && isLikelyAttachmentRoute(window.location.href)) {
+          if (isNativeSlackFileViewerOpen()) {
+            return;
+          }
+          ev.preventDefault();
+          goBackFromAttachment();
+        }
+      },
+      true
+    );
+
+    ipcRenderer?.on('slack-autocomplete:attachment-go-back', () => {
+      goBackFromAttachment();
+    });
+
+    setInterval(handleAttachmentState, 800);
   }
 
   const THREAD_CONTAINER_SELECTORS = [
@@ -2627,6 +2822,7 @@ cat > preload.js <<'EOF'
     setupNativeContextMenu();
     setupAutocompleteObservers();
     setupChannelContextMenuSupport();
+    setupAttachmentEscape();
     setupThreadWatcher();
     setupBadgeUpdater();
     installNativeNotificationBridge();
