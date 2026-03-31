@@ -130,7 +130,8 @@ const {
   Notification,
   webContents,
   Menu,
-  dialog
+  dialog,
+  powerMonitor
 } = require('electron');
 const fs = require('fs');
 const path = require('path');
@@ -1000,9 +1001,35 @@ ipcMain.handle('slack-autocomplete:context-menu', (event, payload = {}) => {
   }
 });
 
+ipcMain.handle('slack-autocomplete:get-idle-time', () => {
+  return powerMonitor.getSystemIdleTime();
+});
+
+function installPermissionHandlers(ses) {
+  ses.setPermissionRequestHandler((wc, permission, callback) => {
+    const url = wc.getURL();
+    if (url.includes('slack.com')) {
+      if (permission === 'idle-detection' || permission === 'notifications') {
+        return callback(true);
+      }
+    }
+    callback(false);
+  });
+
+  ses.setPermissionCheckHandler((_wc, permission, requestingOrigin) => {
+    if (requestingOrigin.includes('slack.com')) {
+      if (permission === 'idle-detection' || permission === 'notifications') {
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
 app.whenReady().then(() => {
   // Global default UA (covers auth popups etc.).
   session.defaultSession.setUserAgent(CHROME_UA);
+  installPermissionHandlers(session.defaultSession);
   registerProtocolHandler();
   installApplicationMenu();
 
@@ -2816,6 +2843,60 @@ cat > preload.js <<'EOF'
     updateBadge();
   }
 
+  function installIdleDetector() {
+    const IDLE_THRESHOLD_S = 300;
+    const POLL_INTERVAL_MS = 15000;
+
+    class SlackIdleDetector extends EventTarget {
+      constructor() {
+        super();
+        this.userState = 'active';
+        this.screenState = 'unlocked';
+        this.onchange = null;
+        this._polling = null;
+      }
+
+      async start() {
+        if (this._polling) return;
+
+        const poll = async () => {
+          try {
+            const idleSeconds = await ipcRenderer.invoke('slack-autocomplete:get-idle-time');
+            const newUserState = idleSeconds >= IDLE_THRESHOLD_S ? 'idle' : 'active';
+            if (newUserState !== this.userState) {
+              this.userState = newUserState;
+              log('IdleDetector: userState changed to', newUserState);
+              const ev = new Event('change');
+              this.dispatchEvent(ev);
+              if (typeof this.onchange === 'function') {
+                try { this.onchange(ev); } catch (err) { log('IdleDetector onchange error', err); }
+              }
+            }
+          } catch (err) {
+            log('IdleDetector poll error', err);
+          }
+        };
+
+        await poll();
+        this._polling = setInterval(poll, POLL_INTERVAL_MS);
+      }
+
+      stop() {
+        if (this._polling) {
+          clearInterval(this._polling);
+          this._polling = null;
+        }
+      }
+
+      static async requestPermission() {
+        return 'granted';
+      }
+    }
+
+    window.IdleDetector = SlackIdleDetector;
+    log('IdleDetector polyfill installed');
+  }
+
   function init() {
     attachKeyListener();
     attachMouseListener();
@@ -2826,6 +2907,7 @@ cat > preload.js <<'EOF'
     setupThreadWatcher();
     setupBadgeUpdater();
     installNativeNotificationBridge();
+    installIdleDetector();
     log('Slack autocomplete preload initialized.');
     exposeDebugHelpers();
   }
