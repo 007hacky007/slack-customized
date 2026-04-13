@@ -533,6 +533,19 @@ function isSlackUrl(targetUrl) {
   }
 }
 
+function isSlackAppNavigationUrl(targetUrl) {
+  try {
+    const { pathname } = new URL(targetUrl);
+    if (!isSlackUrl(targetUrl)) {
+      return false;
+    }
+
+    return pathname === '/client' || pathname.startsWith('/client/');
+  } catch (err) {
+    return false;
+  }
+}
+
 function getIconPath() {
   if (process.platform !== 'darwin') {
     return undefined;
@@ -593,7 +606,7 @@ function loadWindowState() {
       const validUrls = [];
       const seen = new Set();
       parsed.forEach((url) => {
-        if (typeof url === 'string' && isSlackUrl(url) && !seen.has(url)) {
+        if (typeof url === 'string' && isSlackAppNavigationUrl(url) && !seen.has(url)) {
           seen.add(url);
           validUrls.push(url);
         }
@@ -613,7 +626,7 @@ function collectWindowUrls() {
 
   BrowserWindow.getAllWindows().forEach((win) => {
     const url = typeof win.__slackLastUrl === 'string' ? win.__slackLastUrl : SLACK_URL;
-    const normalized = isSlackUrl(url) ? url : SLACK_URL;
+    const normalized = isSlackAppNavigationUrl(url) ? url : SLACK_URL;
     if (!seen.has(normalized)) {
       seen.add(normalized);
       urls.push(normalized);
@@ -711,11 +724,11 @@ function attachWindowStateTracking(win, initialUrl = SLACK_URL) {
   }
 
   win.__slackTrackingAttached = true;
-  win.__slackLastUrl = isSlackUrl(initialUrl) ? initialUrl : SLACK_URL;
+  win.__slackLastUrl = isSlackAppNavigationUrl(initialUrl) ? initialUrl : SLACK_URL;
 
   const updateLastUrl = () => {
     const currentUrl = win.webContents.getURL();
-    if (isSlackUrl(currentUrl)) {
+    if (isSlackAppNavigationUrl(currentUrl)) {
       win.__slackLastUrl = currentUrl;
       scheduleWindowStateSave();
     }
@@ -1003,6 +1016,15 @@ ipcMain.handle('slack-autocomplete:context-menu', (event, payload = {}) => {
 
 ipcMain.handle('slack-autocomplete:get-idle-time', () => {
   return powerMonitor.getSystemIdleTime();
+});
+
+ipcMain.handle('slack-autocomplete:open-external', async (_event, targetUrl) => {
+  if (typeof targetUrl !== 'string' || !targetUrl.trim()) {
+    return { status: 'error', reason: 'invalid-url' };
+  }
+
+  openExternalUrl(targetUrl);
+  return { status: 'opened' };
 });
 
 function installPermissionHandlers(ses) {
@@ -1498,6 +1520,54 @@ cat > preload.js <<'EOF'
     }
 
     fallbackWindowOpen(url);
+  }
+
+  function openExternalLink(url) {
+    if (!url) return;
+    if (ipcRenderer?.invoke) {
+      ipcRenderer.invoke('slack-autocomplete:open-external', url).catch((err) => {
+        log('IPC open-external failed, falling back to window.open', err);
+        fallbackWindowOpen(url);
+      });
+      return;
+    }
+
+    fallbackWindowOpen(url);
+  }
+
+  function isOpenableExternalUrl(targetUrl) {
+    try {
+      const parsed = new URL(targetUrl, window.location.href);
+      return ['http:', 'https:', 'mailto:', 'tel:'].includes(parsed.protocol);
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function setupExternalLinkInterception() {
+    const handlePointerOpen = (event) => {
+      if (!event.isTrusted) return;
+      if (event.defaultPrevented) return;
+      if (event.type === 'click' && event.button !== 0) return;
+      if (!(event.target instanceof Element)) return;
+
+      const anchor = event.target.closest('a[href]');
+      if (!anchor) return;
+
+      const rawHref = anchor.getAttribute('href');
+      if (!rawHref || rawHref.startsWith('#')) return;
+
+      const targetUrl = anchor.href;
+      if (!isOpenableExternalUrl(targetUrl)) return;
+      if (isLikelyMainClientRoute(targetUrl)) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      openExternalLink(targetUrl);
+    };
+
+    document.addEventListener('click', handlePointerOpen, true);
+    document.addEventListener('auxclick', handlePointerOpen, true);
   }
 
   ipcRenderer?.on('slack-autocomplete:open-url', (_event, targetUrl) => {
@@ -2903,6 +2973,7 @@ cat > preload.js <<'EOF'
     setupNativeContextMenu();
     setupAutocompleteObservers();
     setupChannelContextMenuSupport();
+    setupExternalLinkInterception();
     setupAttachmentEscape();
     setupThreadWatcher();
     setupBadgeUpdater();
@@ -2952,4 +3023,3 @@ echo "  npm start"
 echo
 echo "Use \"Clear Cache (Keep Login)\" in the menubar to refresh Slack without signing out."
 echo "Use \"Clear Cache (Full Reset)\" for a complete reset if things are really wedged."
-
