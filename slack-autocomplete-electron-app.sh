@@ -1544,6 +1544,15 @@ cat > preload.js <<'EOF'
     }
   }
 
+  function isSlackHostUrl(targetUrl) {
+    try {
+      const parsed = new URL(targetUrl, window.location.href);
+      return parsed.hostname === 'slack.com' || parsed.hostname.endsWith('.slack.com');
+    } catch (err) {
+      return false;
+    }
+  }
+
   function setupExternalLinkInterception() {
     const handlePointerOpen = (event) => {
       if (!event.isTrusted) return;
@@ -1560,6 +1569,7 @@ cat > preload.js <<'EOF'
       const targetUrl = anchor.href;
       if (!isOpenableExternalUrl(targetUrl)) return;
       if (isLikelyMainClientRoute(targetUrl)) return;
+      if (isSlackHostUrl(targetUrl)) return;
 
       event.preventDefault();
       event.stopPropagation();
