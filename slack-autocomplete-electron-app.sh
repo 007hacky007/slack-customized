@@ -131,6 +131,7 @@ const {
   webContents,
   Menu,
   dialog,
+  net,
   powerMonitor
 } = require('electron');
 const fs = require('fs');
@@ -1061,6 +1062,31 @@ function isSlackSender(event) {
     return /^https:\/\/[a-z0-9.-]*\.slack\.com(\/|$)/i.test(url);
   } catch (e) { return false; }
 }
+
+// Channel export: perform the Slack web-API call from the main process via net.fetch.
+// Renderer fetch to the team API host (e.g. cdn77.slack.com) is blocked by cross-origin
+// CORS in the preload's isolated world; net.fetch is not subject to page CORS and uses the
+// default session cookie jar, so the HttpOnly `d` auth cookie is sent automatically.
+ipcMain.handle('slack-autocomplete:api-call', async (event, payload = {}) => {
+  if (!isSlackSender(event)) throw new Error('api-call rejected: untrusted sender');
+  const { apiBase, teamId, token, method, params } = payload;
+  if (typeof apiBase !== 'string' || typeof method !== 'string') throw new Error('api-call: bad arguments');
+  const body = new URLSearchParams();
+  body.append('token', token);
+  for (const [k, v] of Object.entries(params || {})) {
+    body.append(k, typeof v === 'boolean' ? String(v) : String(v));
+  }
+  const url = apiBase + method + '?slack_route=' + encodeURIComponent(teamId || '');
+  const resp = await net.fetch(url, {
+    method: 'POST',
+    body,
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8' }
+  });
+  let json = null;
+  try { json = await resp.json(); } catch (e) { json = null; }
+  return { status: resp.status, retryAfter: resp.headers.get('retry-after'), json };
+});
 
 ipcMain.handle('slack-autocomplete:save-export:begin', async (event, payload = {}) => {
   if (!isSlackSender(event)) throw new Error('export save rejected: untrusted sender');
@@ -3141,35 +3167,33 @@ cat > preload.js <<'EOF'
       for (;;) {
         if (signal && signal.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
         await spaceFor(method);
-        const fd = new FormData();
-        fd.append('token', cfg.token);
-        for (const k of Object.keys(params || {})) {
-          const v = params[k];
-          fd.append(k, typeof v === 'boolean' ? String(v) : v);
-        }
         log('-> ' + method + '  ' + url);
-        let resp;
+        // The actual HTTP request runs in the main process (net.fetch) to bypass renderer
+        // cross-origin CORS and reuse the session's HttpOnly auth cookie.
+        let res;
         try {
-          resp = await fetch(url, { method: 'POST', body: fd, credentials: 'include', signal });
+          res = await ipcRenderer.invoke('slack-autocomplete:api-call', {
+            apiBase: cfg.apiBase, teamId: cfg.teamId, token: cfg.token, method, params: params || {}
+          });
         } catch (e) {
           if (signal && signal.aborted) throw e;
           attempt++;
-          log('   fetch ERROR (' + (e && e.name) + '): ' + (e && e.message) + '  [attempt ' + attempt + ']');
+          log('   request ERROR: ' + (e && e.message) + '  [attempt ' + attempt + ']');
           if (attempt > 2) {
-            const err = new Error(method + ' fetch failed: ' + (e && e.message) + '  (url: ' + url + ')');
+            const err = new Error(method + ' request failed: ' + (e && e.message) + '  (url: ' + url + ')');
             err.cause = e;
             throw err;
           }
           await exportSleep(exportCore.backoffDelay(attempt), signal);
           continue;
         }
-        log('<- ' + method + '  HTTP ' + resp.status);
-        if (resp.status === 429) { log('   rate-limited; waiting'); await exportSleep(exportCore.parseRetryAfter(resp.headers.get('retry-after')) * 1000, signal); continue; }
-        if (resp.status >= 500) { attempt++; if (attempt > 2) throw new Error('Slack server error ' + resp.status + ' for ' + method); await exportSleep(exportCore.backoffDelay(attempt), signal); continue; }
-        const json = await resp.json();
+        log('<- ' + method + '  HTTP ' + res.status);
+        if (res.status === 429) { log('   rate-limited; waiting'); await exportSleep(exportCore.parseRetryAfter(res.retryAfter) * 1000, signal); continue; }
+        if (res.status >= 500) { attempt++; if (attempt > 2) throw new Error('Slack server error ' + res.status + ' for ' + method); await exportSleep(exportCore.backoffDelay(attempt), signal); continue; }
+        const json = res.json;
         if (json && json.ok === false) {
           log('   ' + method + ' ok=false error=' + json.error);
-          if (json.error === 'ratelimited') { await exportSleep(exportCore.parseRetryAfter(resp.headers.get('retry-after')) * 1000, signal); continue; }
+          if (json.error === 'ratelimited') { await exportSleep(exportCore.parseRetryAfter(res.retryAfter) * 1000, signal); continue; }
         }
         return json;
       }
