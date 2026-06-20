@@ -124,3 +124,30 @@ test('authorOutliers excludes authors X never skipped and below minPosts', () =>
   assert.ok(rows.find((r) => r.authorId === 'Y'));
   assert.ok(!rows.find((r) => r.authorId === 'Z'));
 });
+
+test('parseDateBoundary: YYYY-MM-DD maps to UTC start/end of day (seconds)', () => {
+  assert.equal(A.parseDateBoundary('2026-05-01', false), Date.UTC(2026, 4, 1, 0, 0, 0, 0) / 1000);
+  assert.equal(A.parseDateBoundary('2026-05-31', true), Date.UTC(2026, 4, 31, 23, 59, 59, 999) / 1000);
+  assert.equal(A.parseDateBoundary(null, false), null);
+  assert.throws(() => A.parseDateBoundary('not-a-date', false), /invalid date/);
+  assert.throws(() => A.parseDateBoundary('2026-13-99', false), /invalid date/);  // impossible month/day
+  assert.throws(() => A.parseDateBoundary('2026-02-30', false), /invalid date/);  // Feb 30
+});
+
+test('buildIndex filters posts by since/until (epoch seconds), per-post by its own ts', () => {
+  // fixture ts are 1..7 plus reply 7.1
+  assert.deepEqual(
+    A.buildIndex(DATA, { since: 2, until: 5 }).posts.map((p) => p.ts).sort(),
+    ['2', '3', '4', '5'],
+  );
+  assert.deepEqual(
+    A.buildIndex(DATA, { since: 7 }).posts.map((p) => p.ts).sort(),
+    ['7', '7.1'],
+  );
+  assert.deepEqual(
+    A.buildIndex(DATA, { until: 1 }).posts.map((p) => p.ts),
+    ['1'],
+  );
+  // a reply in range is kept even if we are not excluding threads
+  assert.ok(A.buildIndex(DATA, { since: 7.05 }).posts.some((p) => p.ts === '7.1'));
+});

@@ -56,15 +56,46 @@ function postRecord(post, usersMap) {
   };
 }
 
+// Parse a YYYY-MM-DD (or any Date.parse-able string) into an epoch-seconds boundary.
+// For a plain date, the start boundary is UTC 00:00:00 and the end boundary is UTC
+// 23:59:59.999 of that day, so --until is inclusive of the whole day.
+function parseDateBoundary(str, isEnd) {
+  if (str == null) return null;
+  let ms;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
+    const [y, m, d] = str.split('-').map(Number);
+    const probe = new Date(Date.UTC(y, m - 1, d));
+    if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== m - 1 || probe.getUTCDate() !== d) {
+      throw new Error('invalid date: ' + str);   // rejects e.g. 2026-13-99 or 2026-02-30
+    }
+    ms = isEnd ? Date.UTC(y, m - 1, d, 23, 59, 59, 999) : Date.UTC(y, m - 1, d, 0, 0, 0, 0);
+  } else {
+    ms = Date.parse(str);
+    if (Number.isNaN(ms)) throw new Error('invalid date: ' + str);
+  }
+  return ms / 1000;
+}
+
+function inRange(ts, since, until) {
+  const t = parseFloat(ts);
+  if (since != null && t < since) return false;
+  if (until != null && t > until) return false;
+  return true;
+}
+
 function buildIndex(data, opts) {
   opts = opts || {};
   const excludeThreads = !!opts.excludeThreads;
+  const since = opts.since != null ? opts.since : null;
+  const until = opts.until != null ? opts.until : null;
   const usersMap = (data && data.users) || {};
   const posts = [];
   for (const m of ((data && data.messages) || [])) {
-    posts.push(postRecord(m, usersMap));
+    if (inRange(m.ts, since, until)) posts.push(postRecord(m, usersMap));
     if (!excludeThreads && Array.isArray(m.replies)) {
-      for (const r of m.replies) posts.push(postRecord(r, usersMap));
+      for (const r of m.replies) {
+        if (inRange(r.ts, since, until)) posts.push(postRecord(r, usersMap));
+      }
     }
   }
   // Per-user activity (for the picker): posts authored, and distinct posts reacted to.
@@ -160,13 +191,15 @@ function authorOutliers(posts, xId, opts) {
 // ----------------------------- CLI / IO -----------------------------
 
 function parseArgs(argv) {
-  const out = { file: null, excludeThreads: false, minPosts: 5, topOutliers: 15, minReactors: 5, user: null };
+  const out = { file: null, excludeThreads: false, minPosts: 5, topOutliers: 15, minReactors: 5, since: null, until: null, user: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--exclude-threads') out.excludeThreads = true;
     else if (a === '--min-posts') out.minPosts = parseInt(argv[++i], 10);
     else if (a === '--top-outliers') out.topOutliers = parseInt(argv[++i], 10);
     else if (a === '--min-reactors') out.minReactors = parseInt(argv[++i], 10);
+    else if (a === '--since') out.since = argv[++i];
+    else if (a === '--until') out.until = argv[++i];
     else if (a === '--user') out.user = argv[++i];
     else if (a.startsWith('--')) throw new Error('unknown option: ' + a);
     else if (!out.file) out.file = a;
@@ -233,6 +266,11 @@ function bar(pct, width) {
 function report(index, xId, opts) {
   const xName = nameFor(xId, index.usersMap, {});
   const threadNote = opts.excludeThreads ? ' (thread replies excluded)' : '';
+
+  if (opts.since || opts.until) {
+    console.log('\nDate range (UTC): ' + (opts.since || 'beginning') + ' .. ' + (opts.until || 'now')
+      + '  (' + index.posts.length + ' posts in range)');
+  }
 
   const rows = perAuthorStats(index.posts, xId, { minPosts: opts.minPosts });
   console.log('\n=== How often ' + xName + ' reacts to each author\'s reacted-to posts'
@@ -304,7 +342,22 @@ async function main() {
   }
   if (!opts.file) {
     console.error('Usage: node analyze-reactions.js <export.json> '
-      + '[--exclude-threads] [--min-posts N] [--top-outliers N] [--user <id|name>]');
+      + '[--exclude-threads] [--min-posts N] [--top-outliers N] [--min-reactors N] '
+      + '[--since YYYY-MM-DD] [--until YYYY-MM-DD] [--user <id|name>]');
+    process.exit(2);
+  }
+
+  let sinceTs;
+  let untilTs;
+  try {
+    sinceTs = parseDateBoundary(opts.since, false);
+    untilTs = parseDateBoundary(opts.until, true);
+  } catch (e) {
+    console.error(e.message + ' (expected YYYY-MM-DD)');
+    process.exit(2);
+  }
+  if (sinceTs != null && untilTs != null && sinceTs > untilTs) {
+    console.error('--since is after --until.');
     process.exit(2);
   }
 
@@ -316,9 +369,10 @@ async function main() {
     process.exit(1);
   }
 
-  const index = buildIndex(data, { excludeThreads: opts.excludeThreads });
+  const index = buildIndex(data, { excludeThreads: opts.excludeThreads, since: sinceTs, until: untilTs });
   if (!index.posts.length) {
-    console.error('No messages found in the export.');
+    console.error('No messages found in the export'
+      + (opts.since || opts.until ? ' within the given date range.' : '.'));
     process.exit(1);
   }
 
@@ -351,7 +405,7 @@ async function main() {
 module.exports = {
   snippet, nameFor, distinctReactors, postRecord,
   buildIndex, perAuthorStats, findOutliers, authorOutliers,
-  parseArgs, dateOf, resolveUser,
+  parseArgs, parseDateBoundary, dateOf, resolveUser,
 };
 
 if (require.main === module) {
