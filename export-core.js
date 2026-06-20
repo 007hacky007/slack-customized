@@ -245,9 +245,49 @@ async function fetchThreadReplies(apiCall, opts, hooks) {
   return finalizeThreadReplies(map, threadTs);
 }
 
+function extractReactionUsers(resp, name) {
+  const msg = resp.message || (resp.messages && resp.messages[0]) || null;
+  if (!msg || !Array.isArray(msg.reactions)) return null;
+  const found = msg.reactions.find((x) => x.name === name);
+  return found ? (found.users || []) : null;
+}
+
+async function backfillReactions(apiCall, ctx, messages, report, hooks) {
+  hooks = hooks || {};
+  const targets = [];
+  function visit(m) {
+    if (Array.isArray(m.reactions)) for (const r of m.reactions) targets.push({ m, r });
+    if (Array.isArray(m.replies)) for (const rep of m.replies) visit(rep);
+  }
+  for (const m of (messages || [])) visit(m);
+
+  let done = 0;
+  const total = targets.length;
+  for (const { m, r } of targets) {
+    throwIfAborted(hooks.signal);
+    if (reactionNeedsBackfill(r)) {
+      let resp = null;
+      try { resp = await apiCall('reactions.get', { channel: ctx.channel, timestamp: m.ts, full: true }); } catch (e) { resp = null; }
+      const full = (resp && resp.ok) ? extractReactionUsers(resp, r.name) : null;
+      const have = (r.users && r.users.length) || 0;
+      if (full && full.length >= (r.count | 0)) { r.users = full; r.users_truncated = false; }
+      else {
+        if (full && full.length > have) r.users = full;
+        r.users_truncated = true;
+        report.addTruncatedReaction(m.ts, r.name, (r.users && r.users.length) || 0, r.count | 0);
+      }
+    } else {
+      r.users_truncated = false;
+    }
+    done++;
+    if (hooks.onProgress) hooks.onProgress('reactions', done, total);
+  }
+}
+
 module.exports = {
   parseClientUrl, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
   TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory, fetchThreadReplies,
+  backfillReactions,
 };

@@ -211,3 +211,28 @@ test('fetchThreadReplies falls back to oldest-window when no cursor, inclusive=f
   const replies = await core.fetchThreadReplies(apiCall, { channel: 'C1', threadTs: '1.0' });
   assert.deepEqual(replies.map(r => r.ts), ['2.0', '3.0']);
 });
+
+test('backfillReactions fills full author lists and flags truncation', async () => {
+  const messages = [
+    { ts: '1.0', reactions: [{ name: 'tada', count: 3, users: ['U1'] }] },          // backfillable -> full
+    { ts: '2.0', reactions: [{ name: '+1', count: 1, users: ['U2'] }] },            // already complete
+    { ts: '3.0', reactions: [{ name: 'eyes', count: 5, users: ['U9'] }],            // stays truncated
+      replies: [{ ts: '3.1', reactions: [{ name: 'fire', count: 2, users: ['U1'] }] }] },
+  ];
+  const apiCall = async (method, p) => {
+    if (p.timestamp === '1.0') return { ok: true, message: { reactions: [{ name: 'tada', users: ['U1', 'U2', 'U3'] }] } };
+    if (p.timestamp === '3.0') return { ok: true, message: { reactions: [{ name: 'eyes', users: ['U9', 'U8'] }] } }; // still < 5
+    if (p.timestamp === '3.1') return { ok: true, message: { reactions: [{ name: 'fire', users: ['U1', 'U4'] }] } };
+    return { ok: false, error: 'message_not_found' };
+  };
+  const report = core.createReport();
+  await core.backfillReactions(apiCall, { channel: 'C1' }, messages, report);
+
+  assert.deepEqual(messages[0].reactions[0].users, ['U1', 'U2', 'U3']);
+  assert.equal(messages[0].reactions[0].users_truncated, false);
+  assert.equal(messages[1].reactions[0].users_truncated, false);
+  assert.equal(messages[2].reactions[0].users_truncated, true);
+  assert.deepEqual(messages[2].replies[0].reactions[0].users, ['U1', 'U4']);
+  assert.equal(report.counts.truncated_reactions, 1);
+  assert.equal(report.warnings[0].type, 'reaction_truncated');
+});
