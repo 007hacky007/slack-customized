@@ -325,6 +325,30 @@ function showAllWindows() {
   });
 }
 
+function bringWindowToFront(win) {
+  if (!win || win.isDestroyed()) return;
+
+  try {
+    if (typeof app.focus === 'function') {
+      app.focus({ steal: true });
+    }
+  } catch (err) {
+    console.warn('Failed to focus app', err);
+  }
+
+  try {
+    if (win.isMinimized()) {
+      win.restore();
+    }
+
+    win.show();
+    win.moveTop?.();
+    win.focus();
+  } catch (err) {
+    console.warn('Failed to bring window to front', err);
+  }
+}
+
 function handleDeepLink(targetUrl) {
   const webUrl = normalizeSlackDeepLink(targetUrl) || SLACK_URL;
   focusOrCreateWindow(webUrl);
@@ -915,10 +939,7 @@ ipcMain.handle('slack-autocomplete:notify', async (event, payload = {}) => {
     const contents = webContents.fromId(contentsId);
     const win = contents ? BrowserWindow.fromWebContents(contents) : null;
     if (win) {
-      if (win.isMinimized()) {
-        win.restore();
-      }
-      win.focus();
+      bringWindowToFront(win);
     }
   });
 
