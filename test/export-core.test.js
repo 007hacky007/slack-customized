@@ -47,3 +47,33 @@ test('sanitizeExportFilename caps length and keeps .json', () => {
   assert.ok(out.length <= 120);
   assert.ok(out.endsWith('.json'));
 });
+
+test('cursor and has_more readers', () => {
+  assert.equal(core.getNextCursor({ response_metadata: { next_cursor: 'c1' } }), 'c1');
+  assert.equal(core.getNextCursor({}), null);
+  assert.equal(core.responseHasMore({ has_more: true }), true);
+  assert.equal(core.responseHasMore({}), false);
+});
+
+test('accumulateByTs dedupes and counts new', () => {
+  const m = new Map();
+  assert.equal(core.accumulateByTs(m, [{ ts: '1' }, { ts: '2' }]), 2);
+  assert.equal(core.accumulateByTs(m, [{ ts: '2' }, { ts: '3' }]), 1);
+  assert.equal(m.size, 3);
+});
+
+test('finalizeThreadReplies drops parent by ts and sorts asc', () => {
+  const m = new Map([
+    ['3.0', { ts: '3.0' }],
+    ['1.0', { ts: '1.0' }],   // parent (== threadTs)
+    ['2.0', { ts: '2.0' }],
+  ]);
+  assert.deepEqual(core.finalizeThreadReplies(m, '1.0').map(x => x.ts), ['2.0', '3.0']);
+});
+
+test('reaction backfill predicates', () => {
+  assert.equal(core.reactionNeedsBackfill({ count: 5, users: ['a', 'b'] }), true);
+  assert.equal(core.reactionNeedsBackfill({ count: 2, users: ['a', 'b'] }), false);
+  assert.equal(core.messageNeedsReactionBackfill({ reactions: [{ count: 1, users: ['a'] }, { count: 9, users: [] }] }), true);
+  assert.equal(core.messageNeedsReactionBackfill({ reactions: [] }), false);
+});

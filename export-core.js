@@ -56,6 +56,33 @@ function sanitizeExportFilename(name, opts) {
   return s;
 }
 
+function getNextCursor(resp) {
+  return (resp && resp.response_metadata && resp.response_metadata.next_cursor) || null;
+}
+function responseHasMore(resp) { return !!(resp && resp.has_more); }
+
+function accumulateByTs(map, items) {
+  let added = 0;
+  for (const it of (items || [])) {
+    if (it && it.ts && !map.has(it.ts)) { map.set(it.ts, it); added++; }
+  }
+  return added;
+}
+
+function finalizeThreadReplies(map, threadTs) {
+  return Array.from(map.values())
+    .filter((m) => m.ts !== threadTs)
+    .sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));
+}
+
+function reactionNeedsBackfill(r) {
+  return !!r && (r.count | 0) > ((r.users && r.users.length) || 0);
+}
+function messageNeedsReactionBackfill(m) {
+  return !!m && Array.isArray(m.reactions) && m.reactions.some(reactionNeedsBackfill);
+}
+
 module.exports = {
   parseClientUrl, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
+  getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
 };
