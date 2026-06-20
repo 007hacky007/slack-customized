@@ -214,9 +214,40 @@ async function fetchAllHistory(apiCall, opts, hooks) {
   return Array.from(map.values()).sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));
 }
 
+async function fetchThreadReplies(apiCall, opts, hooks) {
+  hooks = hooks || {};
+  const channel = opts.channel;
+  const threadTs = opts.threadTs;
+  const map = new Map();
+  let cursor = null;
+  let useWindow = false;
+  let maxTs = null;
+  let noProgress = 0;
+  for (;;) {
+    throwIfAborted(hooks.signal);
+    const params = { channel, ts: threadTs, limit: 200 };
+    if (useWindow) { if (maxTs) { params.oldest = maxTs; params.inclusive = false; } }
+    else if (cursor) { params.cursor = cursor; }
+    const resp = await apiCall('conversations.replies', params);
+    if (!resp || resp.ok === false) throw new Error('conversations.replies failed: ' + (resp && resp.error));
+    const items = resp.messages || [];
+    const added = accumulateByTs(map, items);
+    for (const m of items) { if (m && m.ts && (maxTs === null || parseFloat(m.ts) > parseFloat(maxTs))) maxTs = m.ts; }
+    if (hooks.onProgress) hooks.onProgress('thread-page', map.size, null);
+    if (!responseHasMore(resp)) break;
+    if (!useWindow) {
+      const next = getNextCursor(resp);
+      if (next && next !== cursor) { cursor = next; continue; }
+      useWindow = true; // no/stale cursor -> switch to oldest-window fallback
+    }
+    if (useWindow) { if (added === 0) { if (++noProgress >= 2) break; } else noProgress = 0; }
+  }
+  return finalizeThreadReplies(map, threadTs);
+}
+
 module.exports = {
   parseClientUrl, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
-  TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory,
+  TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory, fetchThreadReplies,
 };

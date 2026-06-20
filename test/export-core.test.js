@@ -188,3 +188,26 @@ test('fetchAllHistory throws on api error', async () => {
   const apiCall = async () => ({ ok: false, error: 'channel_not_found' });
   await assert.rejects(() => core.fetchAllHistory(apiCall, { channel: 'C1' }), /channel_not_found/);
 });
+
+test('fetchThreadReplies paginates by cursor and removes parent', async () => {
+  const pages = {
+    'null': { ok: true, messages: [{ ts: '1.0' }, { ts: '2.0' }], has_more: true, response_metadata: { next_cursor: 'c1' } },
+    'c1':   { ok: true, messages: [{ ts: '3.0' }], has_more: false },
+  };
+  const apiCall = async (m, p) => pages[p.cursor || 'null'];
+  const replies = await core.fetchThreadReplies(apiCall, { channel: 'C1', threadTs: '1.0' });
+  assert.deepEqual(replies.map(r => r.ts), ['2.0', '3.0']);
+});
+
+test('fetchThreadReplies falls back to oldest-window when no cursor, inclusive=false, dedupes', async () => {
+  const seen = [];
+  const apiCall = async (m, p) => {
+    seen.push({ cursor: p.cursor || null, oldest: p.oldest || null, inclusive: p.inclusive });
+    if (!p.oldest && !p.cursor) return { ok: true, messages: [{ ts: '1.0' }, { ts: '2.0' }], has_more: true };
+    if (p.oldest === '2.0') { assert.equal(p.inclusive, false); return { ok: true, messages: [{ ts: '3.0' }], has_more: true }; }
+    if (p.oldest === '3.0') return { ok: true, messages: [], has_more: true }; // no progress -> terminates
+    return { ok: true, messages: [], has_more: false };
+  };
+  const replies = await core.fetchThreadReplies(apiCall, { channel: 'C1', threadTs: '1.0' });
+  assert.deepEqual(replies.map(r => r.ts), ['2.0', '3.0']);
+});
