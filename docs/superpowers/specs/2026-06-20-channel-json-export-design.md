@@ -10,8 +10,11 @@ currently open channel** as a single JSON file, including:
 
 - All top-level messages (full channel history, defeating Slack's lazy-loading).
 - All threads and every reply within each thread.
-- All reactions on every message and reply, with the **full list of reaction authors**.
-- A resolved users map plus inline display names (the "Both" representation).
+- All reactions on every message and reply, with reaction authors. Full author lists are
+  fetched where Slack exposes them; any reaction Slack will not return in full is kept with
+  the authors it does return and flagged (see Completeness reporting).
+- A resolved actors map (users **and** bots) plus inline display names (the "Both"
+  representation).
 
 Extraction uses Slack's **internal web API** from the authenticated page context, not DOM
 scraping. This was validated against a real HAR capture of the app
@@ -20,7 +23,15 @@ scraping. This was validated against a real HAR capture of the app
 ## Goals
 
 - One-click export of the current channel to a JSON file on disk.
-- Complete data: no message, thread, reply, or reaction author is missed.
+- **Hard requirement - message/thread/reply coverage:** capture every top-level message,
+  every thread, and every reply. This is verifiable via `has_more` pagination, so any
+  failure to page the full history (an API error or aborted pagination) **fails the export**
+  rather than writing a partial file. We never silently stop mid-pagination.
+- **Best-effort with explicit reporting - reaction authors & actor identities:** these depend
+  on auxiliary endpoints we cannot always fully satisfy, so they are best-effort, and every
+  export **records its completeness**: an `export.complete` boolean, plus machine-readable
+  `export.warnings` and `export.counts` for truncated reactions and unresolved actors (see
+  Completeness reporting).
 - Robust against Slack rate limits (honor standard limits + 429 `Retry-After`).
 - Visible progress bar with a cancel control.
 
@@ -42,20 +53,34 @@ Two cooperating pieces, matching the existing `main.js` / `preload.js` split gen
    - New menu item **File -> "Export Channel as JSON..."**, accelerator `Cmd+Shift+E`.
    - On click: send IPC `slack-autocomplete:export-channel` to the focused window's
      `webContents`.
-   - New IPC handler `slack-autocomplete:save-export`: receives the final JSON string +
-     a suggested filename, shows a native `dialog.showSaveDialog` (default directory:
-     `~/Downloads`, default name `slack-export-<channel>-<YYYYMMDD-HHMMSS>.json`), and
-     writes the file with `fs.writeFile`. Returns `{ saved: bool, path }` to the page.
+   - A small set of **streaming save IPC handlers** (so we never hold a giant JSON string in
+     either process, see Save flow). All of them **validate the sender** first: the call is
+     rejected unless `event.senderFrame` URL is an `https://*.slack.com` origin.
+     - `slack-autocomplete:save-export:begin` `{ suggestedName }`: **sanitizes** the name to a
+       safe basename (strip path separators + control/reserved chars, cap length, force
+       `.json`), shows `dialog.showSaveDialog` (default dir `~/Downloads`), opens a write
+       stream to a **temp file** (`<chosen>.partial`), and returns a `{ ok, token }` handle
+       (or `{ canceled: true }` if the user dismisses the dialog).
+     - `slack-autocomplete:save-export:write` `{ token, chunk }`: appends a serialized chunk
+       to the temp stream (backpressure-aware).
+     - `slack-autocomplete:save-export:commit` `{ token }`: flushes/closes the stream and
+       **atomically renames** the temp file to the final path; returns `{ saved: true, path }`.
+     - `slack-autocomplete:save-export:abort` `{ token }`: closes and **deletes** the temp file
+       (used on cancel/error). No partial file is ever left behind.
 
 2. **Preload (`preload.js`)** - does the actual export, because it runs in the page and
    has same-origin access to Slack's API, cookies, and `localStorage` token.
    - Listens for `slack-autocomplete:export-channel`.
+   - Resolves the channel name, then **opens the save target first** (`save-export:begin`)
+     before the long fetch, so a dialog-cancel costs nothing.
    - Runs the export pipeline (below), rendering a progress overlay.
-   - On completion, calls `ipcRenderer.invoke('slack-autocomplete:save-export', {...})`.
+   - On success, **streams** the serialized JSON to main in batches (`save-export:write` x N)
+     then `save-export:commit`. On cancel/error, calls `save-export:abort`.
 
 All export logic lives in one clearly-delimited section of the preload heredoc, written as
 a small set of focused functions (auth/config resolver, rate-limited API client, history
-pager, thread fetcher, reaction backfiller, user resolver, overlay UI, orchestrator).
+pager, thread fetcher, reaction backfiller, actor resolver, streaming serializer, overlay
+UI, orchestrator).
 
 ## Auth & API access
 
@@ -101,14 +126,28 @@ Form fields: `token`, `channel`, `limit=200`, `ignore_replies=true`,
 ### conversations.replies (thread replies)
 
 For every collected top-level message with `reply_count > 0` (i.e. a thread parent), fetch
-all replies.
+all replies. Each reply is accumulated into a per-thread `Map` keyed by `ts` so any overlap
+between pages can never duplicate a reply.
 
-Form fields: `token`, `channel`, `ts=<thread_ts>`, `limit=200`, `inclusive=true`, and
-`cursor` when paging (fall back to `oldest=<last reply ts>` windowing if no cursor is
-returned - the HAR showed the web client using `latest`/`oldest` windows for replies).
+Base form fields: `token`, `channel`, `ts=<thread_ts>`, `limit=200`.
 
-- The first item returned is the thread parent (same `ts` as the request); we drop it from
-  the replies list since it is already the top-level message, keeping only true replies.
+Pagination is **cursor-first**, with a time-window fallback only if the endpoint returns no
+cursor:
+
+1. **Cursor mode (preferred):** first request has no `cursor`; while `has_more` is true,
+   repeat with `cursor=<response_metadata.next_cursor>`. No `oldest`/`latest`/`inclusive`.
+2. **Time-window fallback** (only if a `has_more:true` response carries no `next_cursor`):
+   request the next page with `oldest=<largest reply ts seen so far>` and **`inclusive=false`**
+   (so the boundary reply is not returned again), walking forward in time.
+3. **Termination:** stop when `has_more` is false, or as a safety guard when a page adds **no
+   new `ts`** to the map (no-progress), to prevent infinite loops.
+4. **Parent removal:** drop the parent by matching `ts === thread_ts` (not by position), since
+   with windowing the parent is not guaranteed to be the first item on every page. The parent
+   is already represented as the top-level message.
+5. **Ordering:** sort the surviving replies chronologically (ascending `ts`) before nesting.
+
+The same `ts`-keyed dedupe + no-progress safety guard is also applied defensively to the
+`conversations.history` cursor loop.
 
 ### reactions.get (full reaction author backfill) - assumption
 
@@ -119,38 +158,76 @@ reply** has `count > users.length`, call `reactions.get` with `token`, `channel`
 top-level messages and all collected replies.
 
 - This endpoint is documented but was **not present in the HAR** (the web client gets full
-  lists lazily on hover). Treated as a best-effort enhancement: if the call fails, we keep
-  the truncated `users` array and mark the reaction with `"users_truncated": true`.
+  lists lazily on hover). Treated as a best-effort enhancement: if the call fails (or still
+  returns fewer authors than `count`), we keep the authors we have and mark the reaction
+  `"users_truncated": true`. Each such reaction increments `export.counts.truncated_reactions`,
+  appends a `export.warnings` entry (with the message `ts` + emoji), and forces
+  `export.complete = false`. This is reporting, not a hard failure (reaction-author
+  completeness is best-effort per Goals).
 
 ### conversations.info (channel metadata)
 
 `token`, `channel`. Used for the channel name (filename + output metadata). If it fails,
 fall back to `conversations.genericInfo` (seen in HAR) and finally to the channel id.
 
-### users.info (name resolution) - assumption
+### Actor resolution: users.info + bots.info - assumption
 
-After all messages/replies/reactions are collected, gather the distinct set of user ids
-(message authors, reply authors, reaction authors). Resolve each via `users.info`
-(`token`, `user=<id>`) to build the users map.
+Not every message author is a human user. Slack uses several shapes, and the resolver must
+handle all of them rather than assuming a `user` id resolvable via `users.info`:
 
-- Not in the HAR (the web client had users cached from boot). Documented and stable. Per
-  distinct id, run once and cache. Private channels usually have a small member set, so the
-  call count is modest. If a lookup fails, the user appears in the map as
-  `{ id, name: id, unresolved: true }`.
+- **Human / normal message:** has a `user` field (`U...`). Resolve via `users.info`
+  (`token`, `user=<id>`).
+- **Bot / app message:** typically `subtype: "bot_message"`, often **no `user`**, carrying
+  `bot_id` (`B...`) plus an embedded `bot_profile` (with `name`, `icons`) and/or a `username`
+  override. Resolve via the embedded `bot_profile` first (no call needed); if absent, call
+  `bots.info` (`token`, `bot=<bot_id>`). Fall back to `username` if present.
+- **Reaction authors** are user ids in the reaction `users` array; resolve as users. (Bots
+  that react appear as their user id.)
+
+We build a single **actors map** keyed by id - human `U...` ids and bot `B...` ids coexist -
+each entry tagged `kind: "user" | "bot"` and `is_bot`. After all messages/replies/reactions
+are collected, gather the distinct set of actor ids (message `user`, message `bot_id`, reply
+authors, reaction authors), resolve each once (cached), and build the map. The inline
+`user_name` on a message is derived from the best available source for its actor
+(user `real_name`/`display_name`, else `bot_profile.name`/bots.info name, else `username`).
+
+- `users.info`/`bots.info` were not in the HAR (the web client had this cached from boot).
+  Documented and stable. If an actor cannot be resolved at all, it appears as
+  `{ id, name: id, kind, unresolved: true }`; each unresolved actor increments
+  `export.counts.unresolved_actors`, adds an `export.warnings` entry, and forces
+  `export.complete = false` (reporting, not a hard failure).
 
 ## Rate limiting & robustness
 
 All requests go through a single shared, serialized rate-limited client:
 
 - A minimum spacing between requests per Slack tier (conservative defaults aligned to
-  standard limits): history/replies ~50/min, `reactions.get` ~20/min, `users.info`
-  ~100/min. Implemented as a simple per-tier delay so we stay under the documented ceilings.
+  standard limits): history/replies ~50/min, `reactions.get` ~20/min,
+  `users.info`/`bots.info` ~100/min. Implemented as a simple per-tier delay so we stay under
+  the documented ceilings.
 - On HTTP `429` (or `{ok:false, error:"ratelimited"}`), read the `Retry-After` header
   (seconds), pause that tier for the stated duration, then retry the same request.
 - On transient network errors / 5xx: retry with exponential backoff (a few attempts) then
   surface a clear error.
 - Requests are made sequentially (no parallel fan-out) to keep behavior predictable under
   limits; threads/users are processed one at a time with progress updates.
+
+## Completeness reporting
+
+Because message/thread/reply coverage is a hard requirement but reaction-author and actor
+resolution are best-effort, every export self-reports its completeness in the `export` block:
+
+- `export.complete` (boolean): `true` only if **zero** reactions were truncated and **zero**
+  actors were left unresolved. Any best-effort shortfall sets it to `false`.
+- `export.counts`: `{ messages, replies, threads, reactions, truncated_reactions,
+  unresolved_actors }` - hard numbers for quick validation.
+- `export.warnings`: an array of structured entries, e.g.
+  `{ type: "reaction_truncated", ts, emoji, got, expected }` and
+  `{ type: "actor_unresolved", id, kind }`, so consumers can find exactly what is partial.
+
+Note the asymmetry: a failure to page the full **message/thread history** is *not* a warning -
+it aborts the whole export (per Goals), so a produced file always has complete message
+coverage. `export.complete` purely reflects reaction-author/actor best-effort gaps.
 
 ## Progress UI
 
@@ -161,7 +238,7 @@ where the total is known and an indeterminate/counter state where it is not:
   until `has_more` is false).
 - Phase 2 - Threads: "Thread X / Y" - determinate (Y known after phase 1).
 - Phase 3 - Reactions: "Backfilling reactions X / Y" - determinate, only if any need it.
-- Phase 4 - Users: "Resolving users X / Y" - determinate.
+- Phase 4 - Actors: "Resolving actors X / Y" - determinate (users + bots).
 - A **Cancel** button aborts the pipeline (an `AbortController` + a cancel flag); no file is
   written on cancel.
 - On success the overlay shows a brief "Saved to <path>" (or "Export canceled" / error)
@@ -169,11 +246,32 @@ where the total is known and an indeterminate/counter state where it is not:
 
 ## Save flow
 
-1. Preload builds the JSON object and `JSON.stringify`s it (pretty-printed, 2-space).
-2. Preload calls `ipcRenderer.invoke('slack-autocomplete:save-export', { json, suggestedName })`.
-3. Main shows `dialog.showSaveDialog` (default dir `~/Downloads`, default name
-   `slack-export-<channelName>-<YYYYMMDD-HHMMSS>.json`, filter `*.json`).
-4. Main writes the file and returns the chosen path (or a canceled flag).
+The save is **streamed** so neither process ever holds a single giant JSON string, and the
+target path is chosen **before** the long fetch so a cancel is cheap.
+
+1. Preload resolves the channel name, then calls `save-export:begin { suggestedName }`. Main
+   sanitizes the name, shows the save dialog (default dir `~/Downloads`, default name
+   `slack-export-<channelName>-<YYYYMMDD-HHMMSS>.json`, filter `*.json`), and opens a write
+   stream to `<chosen>.partial`. If the user cancels the dialog, the export stops immediately
+   (no fetching done).
+2. Preload runs the fetch pipeline, assembling the dataset in memory (the nested
+   message/reply structure + actors map are inherently needed to assemble the document).
+3. Preload **serializes incrementally** and sends batches via `save-export:write`: it emits
+   the `export`/`workspace`/`channel`/`users` header objects first, then streams the
+   `messages` array element-by-element (batched, e.g. a few hundred messages per chunk) as
+   pre-stringified JSON fragments, then the closing bracket. This eliminates the
+   one-giant-string `JSON.stringify` and the giant structured-clone IPC payload flagged for
+   large channels.
+4. Preload calls `save-export:commit`; main flushes, closes, and **atomically renames**
+   `<chosen>.partial` -> `<chosen>`, returning the final path.
+
+The export stays **atomic**: the final file appears only on `commit`. Any cancel/error path
+calls `save-export:abort`, which deletes the `.partial` file.
+
+**Memory note:** the assembled dataset still lives in renderer memory during the run (needed
+for reply nesting + actor map). Streaming removes the *doubling* (object + full string +
+IPC clone). Spilling the dataset to disk during fetch to bound peak memory further is a
+possible future enhancement but is out of scope here (YAGNI).
 
 ## Output JSON schema
 
@@ -182,7 +280,17 @@ where the total is known and an indeterminate/counter state where it is not:
   "export": {
     "exported_at": "2026-06-20T13:49:00.000Z",
     "exported_by": "slack-autocomplete-electron",
-    "version": 1
+    "version": 1,
+    "complete": false,
+    "counts": {
+      "messages": 1240, "replies": 318, "threads": 47, "reactions": 502,
+      "truncated_reactions": 2, "unresolved_actors": 1
+    },
+    "warnings": [
+      { "type": "reaction_truncated", "ts": "1779807375.562979", "emoji": "tada",
+        "got": 25, "expected": 31 },
+      { "type": "actor_unresolved", "id": "U0DEACT1V", "kind": "user" }
+    ]
   },
   "workspace": { "team_id": "T02MCKX93", "name": "CDN77" },
   "channel": {
@@ -194,11 +302,12 @@ where the total is known and an indeterminate/counter state where it is not:
   },
   "users": {
     "U01AGR328JC": {
-      "id": "U01AGR328JC",
-      "name": "jdoe",
-      "real_name": "John Doe",
-      "display_name": "John",
-      "is_bot": false
+      "id": "U01AGR328JC", "kind": "user", "is_bot": false,
+      "name": "jdoe", "real_name": "John Doe", "display_name": "John"
+    },
+    "B07XYZBOT": {
+      "id": "B07XYZBOT", "kind": "bot", "is_bot": true,
+      "name": "GitHub", "real_name": "GitHub"
     }
   },
   "messages": [
@@ -230,45 +339,74 @@ where the total is known and an indeterminate/counter state where it is not:
           "reactions": [ "...same reaction shape..." ]
         }
       ]
+    },
+    {
+      "ts": "1779807500.000200",
+      "subtype": "bot_message",
+      "bot_id": "B07XYZBOT",
+      "username": "GitHub",
+      "user_name": "GitHub",
+      "actor_kind": "bot",
+      "text": "...",
+      "reactions": []
     }
   ]
 }
 ```
 
-- Raw Slack message fields are preserved as returned; we **add** `user_name` (author),
-  `user_names` (reaction authors, aligned with `users`), `users_truncated`, and a nested
+- Raw Slack message fields are preserved as returned; we **add** `user_name` (resolved actor
+  display name, whether human or bot), `user_names` (reaction authors, aligned with `users`),
+  `users_truncated`, `actor_kind` (`"user"`/`"bot"`) for non-user authors, and a nested
   `replies` array on thread parents.
+- Bot/app messages keep their native `bot_id` / `username` / `subtype`; their author resolves
+  through the actor model and is included in the `users` map as a `kind: "bot"` entry.
 - Messages and replies are ordered chronologically (oldest first).
 - Non-thread messages omit `replies` (or set it to `[]`).
 
 ## Error handling summary
 
 - No channel open / token not found -> overlay error, no file.
-- API hard failure mid-export -> overlay error with the failing method; no partial file is
-  written (export is atomic - save only after full success).
-- `reactions.get` / `users.info` per-item failures -> degrade gracefully (truncated flag /
-  unresolved user), export still succeeds.
-- User cancel -> abort cleanly, no file.
+- **Failure to page the full message/thread history** (history/replies error or aborted
+  pagination) -> overlay error with the failing method; `save-export:abort` deletes the temp
+  file. This is a hard failure - we never emit a file with partial message coverage.
+- `reactions.get` per-item failure / still-truncated -> degrade gracefully (`users_truncated`,
+  counts/warnings, `export.complete=false`); export still succeeds.
+- `users.info`/`bots.info` per-actor failure -> degrade gracefully (`unresolved:true`,
+  counts/warnings, `export.complete=false`); export still succeeds.
+- User cancel -> `save-export:abort`, temp file deleted, no final file.
+- Save IPC from a non-slack.com sender frame -> rejected by the handler.
 
 ## Assumptions / risks
 
-1. `reactions.get` and `users.info` shapes are from Slack's documented API, not the HAR.
-   Mitigated by graceful degradation if they behave differently.
+1. `reactions.get`, `users.info`, and `bots.info` shapes are from Slack's documented API,
+   not the HAR. Mitigated by graceful degradation + completeness reporting if they differ.
 2. `localConfig_v2` field names (`teams[teamId].token`, `.url`/`.domain`). Token field is
    well-established; we validate at runtime and error clearly if absent.
 3. Internal-API rate limits for the `xoxc` web token may differ from documented bot-token
    tiers; we stay conservative and always honor `Retry-After`.
 4. Very large channels (tens of thousands of messages, many threads) can take a long time
-   under rate limits; this is expected and surfaced via the progress bar + cancel.
+   under rate limits; this is expected and surfaced via the progress bar + cancel. The
+   assembled dataset is held in renderer memory during the run (see Save flow memory note);
+   the streamed save avoids the additional giant-string/IPC overhead.
+5. The actor model assumes the main author shapes (`user`, and `bot_message` with
+   `bot_id`/`bot_profile`/`username`). Rarer system subtypes that carry neither resolve to an
+   `unresolved` actor and are reported, not dropped.
 
 ## Manual verification plan
 
 Using the private channel from the HAR (or any test channel):
 
-1. Open the channel, run File -> Export Channel as JSON.
-2. Confirm progress bar advances through phases and a file is written to the chosen path.
-3. Validate the JSON: message count matches the channel, threaded messages have `replies`,
-   reactions include `users`/`user_names`, and the `users` map covers all referenced ids.
-4. Re-run on a channel with a high-count reaction to confirm author backfill (or the
-   `users_truncated` fallback).
-5. Cancel mid-export and confirm no file is written.
+1. Open the channel, run File -> Export Channel as JSON; confirm the save dialog appears
+   **before** the long fetch and that canceling it does no work.
+2. Confirm the progress bar advances through phases and a file is written to the chosen path
+   (and that only a `.partial` exists mid-run, replaced atomically on commit).
+3. Validate the JSON: `export.counts` matches the channel, threaded messages have `replies`
+   (no duplicated reply `ts`), reactions include `users`/`user_names`, and the `users` map
+   covers all referenced actor ids.
+4. Re-run on a channel with a high-count reaction to confirm author backfill, or that it is
+   flagged `users_truncated:true` with a matching `export.warnings` entry and
+   `export.complete:false`.
+5. Confirm a **bot/app-authored** message (e.g. an integration post) resolves to a `kind:"bot"`
+   actor with a name, not an unresolved user.
+6. Cancel mid-export and confirm the `.partial` file is deleted and no final file remains.
+7. Spot-check a large channel completes without the renderer freezing during save.
