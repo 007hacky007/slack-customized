@@ -32,3 +32,18 @@ test('workspaceFromConfig returns team id and name', () => {
   assert.deepEqual(core.workspaceFromConfig(CFG, 'T02MCKX93'), { team_id: 'T02MCKX93', name: 'CDN77' });
   assert.deepEqual(core.workspaceFromConfig('bad', 'T02MCKX93'), { team_id: 'T02MCKX93', name: null });
 });
+
+test('sanitizeExportFilename strips paths and forces .json', () => {
+  assert.equal(core.sanitizeExportFilename('../../etc/passwd'), 'etc-passwd.json');
+  assert.equal(core.sanitizeExportFilename('a/b\\c'), 'a-b-c.json');
+  assert.equal(core.sanitizeExportFilename('weird:name?*.json'), 'weird-name-.json');
+  assert.equal(core.sanitizeExportFilename(''), 'slack-export.json');
+  assert.equal(core.sanitizeExportFilename('   '), 'slack-export.json');
+  assert.equal(core.sanitizeExportFilename('ok-name.json'), 'ok-name.json');
+});
+
+test('sanitizeExportFilename caps length and keeps .json', () => {
+  const out = core.sanitizeExportFilename('x'.repeat(500));
+  assert.ok(out.length <= 120);
+  assert.ok(out.endsWith('.json'));
+});

@@ -34,6 +34,28 @@ function workspaceFromConfig(localConfigRaw, teamId) {
   return { team_id: teamId, name };
 }
 
+function sanitizeExportFilename(name, opts) {
+  opts = opts || {};
+  const fallback = opts.fallback || 'slack-export';
+  const maxLength = opts.maxLength || 120;
+  let s = String(name == null ? '' : name);
+  s = s.replace(/[\/\\]/g, '-');          // path separators
+  s = s.replace(/[\x00-\x1f\x7f]/g, '');  // control chars
+  s = s.replace(/[<>:"|?*]/g, '-');       // reserved chars
+  s = s.replace(/\.{2,}/g, '-');          // collapse .. (no traversal)
+  s = s.replace(/-{2,}/g, '-');           // collapse repeated dashes
+  s = s.replace(/^[-.]+/, '');            // strip leading dashes/dots
+  s = s.replace(/[-.\s]+$/, '');          // strip trailing dashes/dots/space
+  s = s.trim();
+  if (!s) s = fallback;
+  if (!/\.json$/i.test(s)) s = s + '.json';
+  if (s.length > maxLength) {
+    const base = s.slice(0, maxLength - 5).replace(/[-.]+$/, '');
+    s = base + '.json';
+  }
+  return s;
+}
+
 module.exports = {
-  parseClientUrl, getTokenForTeam, inferApiBase, workspaceFromConfig,
+  parseClientUrl, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
 };
