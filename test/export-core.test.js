@@ -259,3 +259,39 @@ test('backfillReactions fills full author lists and flags truncation', async () 
   assert.equal(report.counts.truncated_reactions, 1);
   assert.equal(report.warnings[0].type, 'reaction_truncated');
 });
+
+test('runExport assembles a complete document end-to-end', async () => {
+  const history = {
+    'null': { ok: true, has_more: false, messages: [
+      { ts: '2.0', user: 'U1', text: 'hi', reply_count: 1, thread_ts: '2.0', reactions: [{ name: 'tada', count: 3, users: ['U1'] }] },
+      { ts: '1.0', bot_id: 'B1', bot_profile: { name: 'GitHub' }, subtype: 'bot_message', text: 'deploy ok' },
+    ] },
+  };
+  const replies = { '2.0': { ok: true, has_more: false, messages: [ { ts: '2.0', user: 'U1' }, { ts: '2.5', user: 'U2', text: 'reply' } ] } };
+  const apiCall = async (method, p) => {
+    if (method === 'conversations.history') return history[p.cursor || 'null'];
+    if (method === 'conversations.replies') return replies[p.ts];
+    if (method === 'reactions.get' && p.timestamp === '2.0') return { ok: true, message: { reactions: [{ name: 'tada', users: ['U1', 'U2', 'U3'] }] } };
+    if (method === 'users.info') return { ok: true, user: { id: p.user, name: p.user.toLowerCase(), profile: { real_name: 'Real ' + p.user } } };
+    return { ok: false, error: 'unexpected ' + method };
+  };
+  const doc = await core.runExport(apiCall, {
+    channelId: 'C1',
+    channel: { id: 'C1', name: 'general', is_private: false },
+    workspace: { team_id: 'T1', name: 'W' },
+    exportedAt: '2026-06-20T00:00:00.000Z',
+  });
+
+  assert.deepEqual(doc.messages.map(m => m.ts), ['1.0', '2.0']);                  // chronological
+  const threaded = doc.messages.find(m => m.ts === '2.0');
+  assert.deepEqual(threaded.replies.map(r => r.ts), ['2.5']);                     // parent dropped
+  assert.equal(threaded.user_name, 'Real U1');
+  assert.deepEqual(threaded.reactions[0].users, ['U1', 'U2', 'U3']);             // backfilled
+  assert.deepEqual(threaded.reactions[0].user_names, ['Real U1', 'Real U2', 'Real U3']);
+  const bot = doc.messages.find(m => m.ts === '1.0');
+  assert.equal(bot.user_name, 'GitHub');
+  assert.equal(bot.actor_kind, 'bot');
+  assert.equal(doc.users.B1.kind, 'bot');
+  assert.equal(doc.export.complete, true);
+  assert.deepEqual(doc.export.counts, { messages: 2, replies: 1, threads: 1, reactions: 1, truncated_reactions: 0, unresolved_actors: 0 });
+});

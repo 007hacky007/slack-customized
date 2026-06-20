@@ -314,10 +314,60 @@ async function resolveActors(apiCall, refs, report, hooks) {
   return users;
 }
 
+async function runExport(apiCall, ctx, hooks) {
+  hooks = hooks || {};
+  const report = createReport();
+
+  const messages = await fetchAllHistory(apiCall, { channel: ctx.channelId }, hooks);
+
+  const parents = messages.filter((m) => (m.reply_count | 0) > 0);
+  let ti = 0;
+  for (const m of parents) {
+    throwIfAborted(hooks.signal);
+    m.replies = await fetchThreadReplies(apiCall, { channel: ctx.channelId, threadTs: m.thread_ts || m.ts }, hooks);
+    ti++;
+    if (hooks.onProgress) hooks.onProgress('threads', ti, parents.length);
+  }
+
+  await backfillReactions(apiCall, { channel: ctx.channelId }, messages, report, hooks);
+
+  const refs = collectActorRefs(messages);
+  const users = await resolveActors(apiCall, refs, report, hooks);
+
+  let replyCount = 0;
+  let reactionCount = 0;
+  function enrich(m) {
+    const ref = resolveActorRef(m);
+    if (ref) {
+      if (ref.kind === 'user' && ref.id) { const e = users[ref.id]; m.user_name = e ? pickInlineName(e) : ref.id; }
+      else if (ref.kind === 'bot' && ref.id) { const e = users[ref.id]; m.user_name = e ? pickInlineName(e) : (ref.username || ref.id); m.actor_kind = 'bot'; }
+      else if (ref.username) { m.user_name = ref.username; m.actor_kind = 'unknown'; }
+    }
+    if (Array.isArray(m.reactions)) {
+      for (const r of m.reactions) {
+        reactionCount++;
+        r.user_names = (r.users || []).map((id) => { const e = users[id]; return e ? pickInlineName(e) : id; });
+      }
+    }
+    if (Array.isArray(m.replies)) { for (const rep of m.replies) { replyCount++; enrich(rep); } }
+  }
+  for (const m of messages) enrich(m);
+
+  report.setBaseCounts({ messages: messages.length, replies: replyCount, threads: parents.length, reactions: reactionCount });
+
+  return {
+    export: report.build(ctx.exportedAt),
+    workspace: ctx.workspace,
+    channel: ctx.channel,
+    users,
+    messages,
+  };
+}
+
 module.exports = {
   parseClientUrl, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
   TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory, fetchThreadReplies,
-  backfillReactions, resolveActors,
+  backfillReactions, resolveActors, runExport,
 };
