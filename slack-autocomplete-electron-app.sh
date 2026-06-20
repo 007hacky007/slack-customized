@@ -135,6 +135,7 @@ const {
 } = require('electron');
 const fs = require('fs');
 const path = require('path');
+const exportCore = require('./export-core.js');
 
 // You can override this when launching by setting SLACK_URL env var.
 // Example:
@@ -479,6 +480,15 @@ function installApplicationMenu() {
           label: 'Reset Window State',
           accelerator: 'CmdOrCtrl+Shift+R',
           click: () => resetWindowState()
+        },
+        { type: 'separator' },
+        {
+          label: 'Export Channel as JSON...',
+          accelerator: 'CmdOrCtrl+Shift+E',
+          click: (_item, focusedWindow) => {
+            const w = focusedWindow || BrowserWindow.getFocusedWindow();
+            if (w) w.webContents.send('slack-autocomplete:export-channel');
+          }
         },
         { type: 'separator' },
         IS_MAC ? { role: 'close' } : { role: 'quit' }
@@ -1037,6 +1047,67 @@ ipcMain.handle('slack-autocomplete:context-menu', (event, payload = {}) => {
 
 ipcMain.handle('slack-autocomplete:get-idle-time', () => {
   return powerMonitor.getSystemIdleTime();
+});
+
+// --- Channel export: streaming save to a temp file, atomic rename on commit ---
+const exportSaveSessions = new Map();
+let exportSaveCounter = 0;
+
+function isSlackSender(event) {
+  try {
+    const url = (event.senderFrame && event.senderFrame.url)
+      || (event.sender && typeof event.sender.getURL === 'function' && event.sender.getURL())
+      || '';
+    return /^https:\/\/[a-z0-9.-]*\.slack\.com(\/|$)/i.test(url);
+  } catch (e) { return false; }
+}
+
+ipcMain.handle('slack-autocomplete:save-export:begin', async (event, payload = {}) => {
+  if (!isSlackSender(event)) throw new Error('export save rejected: untrusted sender');
+  const safe = exportCore.sanitizeExportFilename(payload.suggestedName || 'slack-export.json');
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const defaultPath = path.join(app.getPath('downloads'), safe);
+  const res = await dialog.showSaveDialog(win, {
+    defaultPath,
+    filters: [{ name: 'JSON', extensions: ['json'] }]
+  });
+  if (res.canceled || !res.filePath) return { canceled: true };
+  const finalPath = res.filePath;
+  const tmpPath = finalPath + '.partial';
+  const stream = fs.createWriteStream(tmpPath, { encoding: 'utf8' });
+  const token = 'exp' + (++exportSaveCounter);
+  exportSaveSessions.set(token, { stream, tmpPath, finalPath });
+  return { ok: true, token };
+});
+
+ipcMain.handle('slack-autocomplete:save-export:write', async (event, payload = {}) => {
+  if (!isSlackSender(event)) throw new Error('export save rejected: untrusted sender');
+  const s = exportSaveSessions.get(payload.token);
+  if (!s) throw new Error('unknown export token');
+  await new Promise((resolve, reject) => {
+    s.stream.write(payload.chunk, (err) => (err ? reject(err) : resolve()));
+  });
+  return { ok: true };
+});
+
+ipcMain.handle('slack-autocomplete:save-export:commit', async (event, payload = {}) => {
+  if (!isSlackSender(event)) throw new Error('export save rejected: untrusted sender');
+  const s = exportSaveSessions.get(payload.token);
+  if (!s) throw new Error('unknown export token');
+  await new Promise((resolve, reject) => s.stream.end((err) => (err ? reject(err) : resolve())));
+  await fs.promises.rename(s.tmpPath, s.finalPath);
+  exportSaveSessions.delete(payload.token);
+  return { saved: true, path: s.finalPath };
+});
+
+ipcMain.handle('slack-autocomplete:save-export:abort', async (event, payload = {}) => {
+  if (!isSlackSender(event)) throw new Error('export save rejected: untrusted sender');
+  const s = exportSaveSessions.get(payload.token);
+  if (!s) return { ok: true };
+  try { await new Promise((resolve) => s.stream.end(() => resolve())); } catch (e) { /* ignore */ }
+  try { await fs.promises.unlink(s.tmpPath); } catch (e) { /* ignore */ }
+  exportSaveSessions.delete(payload.token);
+  return { ok: true };
 });
 
 ipcMain.handle('slack-autocomplete:open-external', async (_event, targetUrl) => {
