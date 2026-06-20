@@ -105,3 +105,24 @@ test('collectActorRefs gathers users, bots, reaction authors, replies', () => {
   assert.deepEqual([...refs.botIds].sort(), ['B1', 'B2']);
   assert.deepEqual(refs.embeddedBotProfiles.get('B1'), { name: 'GH' });
 });
+
+test('createReport tracks counts, warnings, completeness', () => {
+  const r = core.createReport();
+  r.setBaseCounts({ messages: 10, replies: 4, threads: 2, reactions: 3 });
+  let out = r.build('2026-06-20T00:00:00.000Z');
+  assert.equal(out.complete, true);
+  assert.equal(out.exported_by, 'slack-autocomplete-electron');
+  assert.equal(out.version, 1);
+  assert.deepEqual(out.counts, { messages: 10, replies: 4, threads: 2, reactions: 3, truncated_reactions: 0, unresolved_actors: 0 });
+
+  r.addTruncatedReaction('1.0', 'tada', 25, 31);
+  r.addUnresolvedActor('U9', 'user');
+  out = r.build('2026-06-20T00:00:00.000Z');
+  assert.equal(out.complete, false);
+  assert.equal(out.counts.truncated_reactions, 1);
+  assert.equal(out.counts.unresolved_actors, 1);
+  assert.deepEqual(out.warnings, [
+    { type: 'reaction_truncated', ts: '1.0', emoji: 'tada', got: 25, expected: 31 },
+    { type: 'actor_unresolved', id: 'U9', kind: 'user' },
+  ]);
+});

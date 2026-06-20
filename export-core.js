@@ -125,8 +125,40 @@ function collectActorRefs(messages) {
   return { userIds, botIds, embeddedBotProfiles };
 }
 
+function createReport() {
+  const counts = { messages: 0, replies: 0, threads: 0, reactions: 0, truncated_reactions: 0, unresolved_actors: 0 };
+  const warnings = [];
+  return {
+    counts, warnings,
+    setBaseCounts(b) {
+      counts.messages = b.messages | 0;
+      counts.replies = b.replies | 0;
+      counts.threads = b.threads | 0;
+      counts.reactions = b.reactions | 0;
+    },
+    addTruncatedReaction(ts, emoji, got, expected) {
+      counts.truncated_reactions++;
+      warnings.push({ type: 'reaction_truncated', ts, emoji, got, expected });
+    },
+    addUnresolvedActor(id, kind) {
+      counts.unresolved_actors++;
+      warnings.push({ type: 'actor_unresolved', id, kind });
+    },
+    build(exportedAt) {
+      return {
+        exported_at: exportedAt,
+        exported_by: 'slack-autocomplete-electron',
+        version: 1,
+        complete: counts.truncated_reactions === 0 && counts.unresolved_actors === 0,
+        counts: Object.assign({}, counts),
+        warnings: warnings.slice(),
+      };
+    },
+  };
+}
+
 module.exports = {
   parseClientUrl, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
-  resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName,
+  resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
 };
