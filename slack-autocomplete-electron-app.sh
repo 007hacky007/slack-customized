@@ -1077,6 +1077,14 @@ ipcMain.handle('slack-autocomplete:save-export:begin', async (event, payload = {
   const stream = fs.createWriteStream(tmpPath, { encoding: 'utf8' });
   const token = 'exp' + (++exportSaveCounter);
   exportSaveSessions.set(token, { stream, tmpPath, finalPath });
+  const cleanupOnDestroy = () => {
+    const s = exportSaveSessions.get(token);
+    if (!s) return;
+    try { s.stream.end(() => {}); } catch (e) { /* ignore */ }
+    fs.promises.unlink(s.tmpPath).catch(() => {});
+    exportSaveSessions.delete(token);
+  };
+  event.sender.once('destroyed', cleanupOnDestroy);
   return { ok: true, token };
 });
 
