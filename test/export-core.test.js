@@ -77,3 +77,31 @@ test('reaction backfill predicates', () => {
   assert.equal(core.messageNeedsReactionBackfill({ reactions: [{ count: 1, users: ['a'] }, { count: 9, users: [] }] }), true);
   assert.equal(core.messageNeedsReactionBackfill({ reactions: [] }), false);
 });
+
+test('resolveActorRef handles user, bot, username-only', () => {
+  assert.deepEqual(core.resolveActorRef({ user: 'U1' }), { kind: 'user', id: 'U1' });
+  assert.deepEqual(core.resolveActorRef({ bot_id: 'B1', bot_profile: { name: 'GH' }, username: 'GitHub' }),
+    { kind: 'bot', id: 'B1', embeddedProfile: { name: 'GH' }, username: 'GitHub' });
+  assert.deepEqual(core.resolveActorRef({ username: 'Webhook' }), { kind: 'unknown', id: null, username: 'Webhook' });
+  assert.equal(core.resolveActorRef({}), null);
+});
+
+test('buildUserEntry / buildBotEntry / pickInlineName', () => {
+  const u = core.buildUserEntry({ id: 'U1', name: 'jdoe', is_bot: false, profile: { real_name: 'John Doe', display_name: 'John' } });
+  assert.deepEqual(u, { id: 'U1', kind: 'user', is_bot: false, name: 'John', real_name: 'John Doe', display_name: 'John' });
+  assert.equal(core.pickInlineName(u), 'John');
+  const b = core.buildBotEntry({ name: 'GitHub' }, 'B1');
+  assert.deepEqual(b, { id: 'B1', kind: 'bot', is_bot: true, name: 'GitHub', real_name: 'GitHub' });
+});
+
+test('collectActorRefs gathers users, bots, reaction authors, replies', () => {
+  const messages = [
+    { user: 'U1', reactions: [{ name: '+1', users: ['U2', 'U3'] }],
+      replies: [{ user: 'U4' }, { bot_id: 'B1', bot_profile: { name: 'GH' } }] },
+    { bot_id: 'B2' },
+  ];
+  const refs = core.collectActorRefs(messages);
+  assert.deepEqual([...refs.userIds].sort(), ['U1', 'U2', 'U3', 'U4']);
+  assert.deepEqual([...refs.botIds].sort(), ['B1', 'B2']);
+  assert.deepEqual(refs.embeddedBotProfiles.get('B1'), { name: 'GH' });
+});
