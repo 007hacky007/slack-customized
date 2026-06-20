@@ -112,15 +112,61 @@ function findOutliers(posts, xId, opts) {
   return cands.slice(0, top);
 }
 
+// "Which authors don't appeal to X": for each author Y, aggregate Y's reacted-to posts
+// that X skipped - total missed reactors (primary rank), avg popularity of those skips,
+// and how many were "popular" (>= minReactors), plus the single most-reacted skipped post.
+function authorOutliers(posts, xId, opts) {
+  opts = opts || {};
+  const minPosts = opts.minPosts != null ? opts.minPosts : 5;
+  const minReactors = opts.minReactors != null ? opts.minReactors : 5;
+  const top = opts.top != null ? opts.top : 15;
+  const byAuthor = new Map();
+  for (const p of posts) {
+    if (!p.authorId || p.authorId === xId) continue;
+    if (!p.hasReaction) continue;
+    let a = byAuthor.get(p.authorId);
+    if (!a) {
+      a = { authorId: p.authorId, name: p.authorName, denom: 0, skipped: 0, missed: 0, popularSkipped: 0, top: null };
+      byAuthor.set(p.authorId, a);
+    }
+    a.denom++;
+    if (!p.reactorSet.has(xId)) {
+      a.skipped++;
+      a.missed += p.reactorCount;
+      if (p.reactorCount >= minReactors) a.popularSkipped++;
+      if (!a.top || p.reactorCount > a.top.reactorCount) {
+        a.top = { reactorCount: p.reactorCount, ts: p.ts, text: p.text };
+      }
+    }
+  }
+  const rows = [];
+  for (const a of byAuthor.values()) {
+    if (a.denom < minPosts || a.skipped === 0) continue;
+    rows.push({
+      authorId: a.authorId,
+      name: a.name,
+      denom: a.denom,
+      skipped: a.skipped,
+      missed: a.missed,
+      avg: a.skipped ? a.missed / a.skipped : 0,
+      popularSkipped: a.popularSkipped,
+      top: a.top,
+    });
+  }
+  rows.sort((x, y) => (y.missed - x.missed) || (y.skipped - x.skipped) || x.name.localeCompare(y.name));
+  return rows.slice(0, top);
+}
+
 // ----------------------------- CLI / IO -----------------------------
 
 function parseArgs(argv) {
-  const out = { file: null, excludeThreads: false, minPosts: 5, topOutliers: 15, user: null };
+  const out = { file: null, excludeThreads: false, minPosts: 5, topOutliers: 15, minReactors: 5, user: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--exclude-threads') out.excludeThreads = true;
     else if (a === '--min-posts') out.minPosts = parseInt(argv[++i], 10);
     else if (a === '--top-outliers') out.topOutliers = parseInt(argv[++i], 10);
+    else if (a === '--min-reactors') out.minReactors = parseInt(argv[++i], 10);
     else if (a === '--user') out.user = argv[++i];
     else if (a.startsWith('--')) throw new Error('unknown option: ' + a);
     else if (!out.file) out.file = a;
@@ -128,6 +174,7 @@ function parseArgs(argv) {
   }
   if (!Number.isFinite(out.minPosts) || out.minPosts < 1) out.minPosts = 5;
   if (!Number.isFinite(out.topOutliers) || out.topOutliers < 1) out.topOutliers = 15;
+  if (!Number.isFinite(out.minReactors) || out.minReactors < 1) out.minReactors = 5;
   return out;
 }
 
@@ -204,8 +251,34 @@ function report(index, xId, opts) {
     }
   }
 
+  const authorRows = authorOutliers(index.posts, xId, {
+    minPosts: opts.minPosts, minReactors: opts.minReactors, top: opts.topOutliers,
+  });
+  console.log('\n=== Which authors do not appeal to ' + xName
+    + ': well-received posts ' + xName + ' skips (top ' + opts.topOutliers + ')' + threadNote + ' ===');
+  console.log('(skipped = that author\'s reacted-to posts ' + xName + ' did not react to; '
+    + 'missed = total reactors on them [recommended sort]; '
+    + 'popular = skips with >= ' + opts.minReactors + ' reactors)\n');
+  if (!authorRows.length) {
+    console.log('  (no authors meet the threshold)');
+  } else {
+    const nameW = Math.min(30, Math.max(12, ...authorRows.map((r) => r.name.length)));
+    console.log('  ' + 'author'.padEnd(nameW) + '  ' + 'skipped'.padStart(9)
+      + '  ' + 'missed'.padStart(6) + '  ' + 'avg'.padStart(5) + '  ' + 'popular'.padStart(7)
+      + '   top skipped');
+    for (const r of authorRows) {
+      const ex = r.top ? '(' + r.top.reactorCount + ') "' + r.top.text + '"' : '';
+      console.log('  ' + r.name.padEnd(nameW)
+        + '  ' + (r.skipped + '/' + r.denom).padStart(9)
+        + '  ' + String(r.missed).padStart(6)
+        + '  ' + r.avg.toFixed(1).padStart(5)
+        + '  ' + String(r.popularSkipped).padStart(7)
+        + '   ' + ex);
+    }
+  }
+
   const outliers = findOutliers(index.posts, xId, { top: opts.topOutliers });
-  console.log('\n=== Outliers: popular posts ' + xName + ' did NOT react to (top '
+  console.log('\n=== Outliers: individual popular posts ' + xName + ' did NOT react to (top '
     + opts.topOutliers + ')' + threadNote + ' ===');
   console.log('(ranked by number of distinct reactors)\n');
   if (!outliers.length) {
@@ -277,7 +350,7 @@ async function main() {
 
 module.exports = {
   snippet, nameFor, distinctReactors, postRecord,
-  buildIndex, perAuthorStats, findOutliers,
+  buildIndex, perAuthorStats, findOutliers, authorOutliers,
   parseArgs, dateOf, resolveUser,
 };
 
