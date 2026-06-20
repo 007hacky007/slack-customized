@@ -166,3 +166,25 @@ test('streamExportJson handles empty messages', () => {
   for (const chunk of core.streamExportJson(doc)) out += chunk;
   assert.deepEqual(JSON.parse(out), doc);
 });
+
+test('fetchAllHistory follows cursors, dedupes, sorts asc', async () => {
+  const pages = {
+    'null': { ok: true, messages: [{ ts: '3.0' }, { ts: '2.0' }], has_more: true, response_metadata: { next_cursor: 'c1' } },
+    'c1':   { ok: true, messages: [{ ts: '2.0' }, { ts: '1.0' }], has_more: false },
+  };
+  const calls = [];
+  const apiCall = async (method, params) => { calls.push([method, params.cursor || 'null']); return pages[params.cursor || 'null']; };
+  const msgs = await core.fetchAllHistory(apiCall, { channel: 'C1' });
+  assert.deepEqual(msgs.map(m => m.ts), ['1.0', '2.0', '3.0']);
+  assert.deepEqual(calls, [['conversations.history', 'null'], ['conversations.history', 'c1']]);
+});
+
+test('fetchAllHistory throws when has_more but no cursor', async () => {
+  const apiCall = async () => ({ ok: true, messages: [{ ts: '1.0' }], has_more: true });
+  await assert.rejects(() => core.fetchAllHistory(apiCall, { channel: 'C1' }), /stalled/);
+});
+
+test('fetchAllHistory throws on api error', async () => {
+  const apiCall = async () => ({ ok: false, error: 'channel_not_found' });
+  await assert.rejects(() => core.fetchAllHistory(apiCall, { channel: 'C1' }), /channel_not_found/);
+});

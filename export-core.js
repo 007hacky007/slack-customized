@@ -188,9 +188,35 @@ function* streamExportJson(doc) {
   yield ']\n}\n';
 }
 
+function throwIfAborted(signal) {
+  if (signal && signal.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
+}
+
+async function fetchAllHistory(apiCall, opts, hooks) {
+  hooks = hooks || {};
+  const channel = opts.channel;
+  const map = new Map();
+  let cursor = null;
+  for (;;) {
+    throwIfAborted(hooks.signal);
+    const params = { channel, limit: 200, ignore_replies: true, no_user_profile: true };
+    if (cursor) params.cursor = cursor;
+    const resp = await apiCall('conversations.history', params);
+    if (!resp || resp.ok === false) throw new Error('conversations.history failed: ' + (resp && resp.error));
+    accumulateByTs(map, resp.messages || []);
+    if (hooks.onProgress) hooks.onProgress('messages', map.size, null);
+    if (!responseHasMore(resp)) break;
+    const next = getNextCursor(resp);
+    if (!next) throw new Error('history pagination stalled: has_more without next_cursor');
+    if (cursor && next === cursor) throw new Error('history pagination stalled: cursor did not advance');
+    cursor = next;
+  }
+  return Array.from(map.values()).sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));
+}
+
 module.exports = {
   parseClientUrl, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
-  TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson,
+  TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory,
 };
