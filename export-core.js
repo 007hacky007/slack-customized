@@ -284,10 +284,40 @@ async function backfillReactions(apiCall, ctx, messages, report, hooks) {
   }
 }
 
+async function resolveActors(apiCall, refs, report, hooks) {
+  hooks = hooks || {};
+  const users = {};
+  const total = refs.userIds.size + refs.botIds.size;
+  let done = 0;
+  for (const id of refs.userIds) {
+    throwIfAborted(hooks.signal);
+    let resp = null;
+    try { resp = await apiCall('users.info', { user: id }); } catch (e) { resp = null; }
+    if (resp && resp.ok && resp.user) users[id] = buildUserEntry(resp.user);
+    else { users[id] = { id, kind: 'user', name: id, unresolved: true }; report.addUnresolvedActor(id, 'user'); }
+    done++;
+    if (hooks.onProgress) hooks.onProgress('actors', done, total);
+  }
+  for (const id of refs.botIds) {
+    throwIfAborted(hooks.signal);
+    const prof = refs.embeddedBotProfiles.get(id);
+    if (prof) { users[id] = buildBotEntry(prof, id); }
+    else {
+      let resp = null;
+      try { resp = await apiCall('bots.info', { bot: id }); } catch (e) { resp = null; }
+      if (resp && resp.ok && resp.bot) users[id] = buildBotEntry(resp.bot, id);
+      else { users[id] = { id, kind: 'bot', name: id, unresolved: true }; report.addUnresolvedActor(id, 'bot'); }
+    }
+    done++;
+    if (hooks.onProgress) hooks.onProgress('actors', done, total);
+  }
+  return users;
+}
+
 module.exports = {
   parseClientUrl, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
   TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory, fetchThreadReplies,
-  backfillReactions,
+  backfillReactions, resolveActors,
 };

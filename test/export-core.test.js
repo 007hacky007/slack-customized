@@ -48,6 +48,29 @@ test('sanitizeExportFilename caps length and keeps .json', () => {
   assert.ok(out.endsWith('.json'));
 });
 
+test('resolveActors resolves users, embedded bots, bots.info, and flags unresolved', async () => {
+  const refs = {
+    userIds: new Set(['U1', 'UBAD']),
+    botIds: new Set(['B1', 'B2']),
+    embeddedBotProfiles: new Map([['B1', { name: 'GitHub' }]]),
+  };
+  const apiCall = async (method, p) => {
+    if (method === 'users.info' && p.user === 'U1') return { ok: true, user: { id: 'U1', name: 'jdoe', profile: { real_name: 'John Doe', display_name: 'John' } } };
+    if (method === 'users.info' && p.user === 'UBAD') return { ok: false, error: 'user_not_found' };
+    if (method === 'bots.info' && p.bot === 'B2') return { ok: true, bot: { id: 'B2', name: 'Jira' } };
+    return { ok: false, error: 'unknown' };
+  };
+  const report = core.createReport();
+  const users = await core.resolveActors(apiCall, refs, report);
+
+  assert.equal(users.U1.name, 'John');
+  assert.equal(users.U1.kind, 'user');
+  assert.deepEqual(users.UBAD, { id: 'UBAD', kind: 'user', name: 'UBAD', unresolved: true });
+  assert.deepEqual(users.B1, { id: 'B1', kind: 'bot', is_bot: true, name: 'GitHub', real_name: 'GitHub' });
+  assert.equal(users.B2.name, 'Jira');
+  assert.equal(report.counts.unresolved_actors, 1);
+});
+
 test('cursor and has_more readers', () => {
   assert.equal(core.getNextCursor({ response_metadata: { next_cursor: 'c1' } }), 'c1');
   assert.equal(core.getNextCursor({}), null);
