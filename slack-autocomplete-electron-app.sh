@@ -1205,6 +1205,7 @@ cat > preload.js <<'EOF'
   }
 
   const { ipcRenderer } = require('electron');
+  const exportCore = require('./export-core.js');
 
   const DEBUG = (() => {
     try {
@@ -3092,6 +3093,167 @@ cat > preload.js <<'EOF'
     log('Slack autocomplete preload initialized.');
     exposeDebugHelpers();
   }
+
+  // ===================== Channel JSON export (web API) =====================
+  function exportSleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+      if (signal && signal.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; return reject(e); }
+      const t = setTimeout(resolve, ms);
+      if (signal) signal.addEventListener('abort', () => { clearTimeout(t); const e = new Error('aborted'); e.name = 'AbortError'; reject(e); }, { once: true });
+    });
+  }
+
+  function exportTsStamp() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+  }
+
+  function getExportConfig() {
+    const ids = exportCore.parseClientUrl(window.location.pathname);
+    if (!ids) throw new Error('Open a channel first (no channel in the URL).');
+    const raw = window.localStorage.getItem('localConfig_v2');
+    const token = exportCore.getTokenForTeam(raw, ids.teamId);
+    const apiBase = exportCore.inferApiBase(raw, ids.teamId);
+    if (!token || !apiBase) throw new Error('Could not find the Slack token/config in this workspace.');
+    return { teamId: ids.teamId, channelId: ids.channelId, token, apiBase, localConfigRaw: raw };
+  }
+
+  function createApiCall(cfg, signal) {
+    const lastAt = {};
+    async function spaceFor(method) {
+      const tier = exportCore.methodTier(method);
+      const interval = exportCore.tierIntervalMs(method);
+      const now = Date.now();
+      const wait = Math.max(0, (lastAt[tier] || 0) + interval - now);
+      if (wait) await exportSleep(wait, signal);
+      lastAt[tier] = Date.now();
+    }
+    return async function apiCall(method, params) {
+      let attempt = 0;
+      for (;;) {
+        if (signal && signal.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
+        await spaceFor(method);
+        const fd = new FormData();
+        fd.append('token', cfg.token);
+        for (const k of Object.keys(params || {})) {
+          const v = params[k];
+          fd.append(k, typeof v === 'boolean' ? String(v) : v);
+        }
+        const url = cfg.apiBase + method + '?slack_route=' + encodeURIComponent(cfg.teamId);
+        let resp;
+        try {
+          resp = await fetch(url, { method: 'POST', body: fd, credentials: 'include', signal });
+        } catch (e) {
+          if (signal && signal.aborted) throw e;
+          attempt++;
+          if (attempt > 5) throw e;
+          await exportSleep(exportCore.backoffDelay(attempt), signal);
+          continue;
+        }
+        if (resp.status === 429) { await exportSleep(exportCore.parseRetryAfter(resp.headers.get('retry-after')) * 1000, signal); continue; }
+        if (resp.status >= 500) { attempt++; if (attempt > 5) throw new Error('Slack server error ' + resp.status); await exportSleep(exportCore.backoffDelay(attempt), signal); continue; }
+        const json = await resp.json();
+        if (json && json.ok === false && json.error === 'ratelimited') { await exportSleep(exportCore.parseRetryAfter(resp.headers.get('retry-after')) * 1000, signal); continue; }
+        return json;
+      }
+    };
+  }
+
+  function createExportOverlay() {
+    const root = document.createElement('div');
+    root.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;font-family:-apple-system,Segoe UI,sans-serif;';
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#1d1c1d;color:#fff;min-width:340px;max-width:80vw;padding:20px 22px;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,0.5);';
+    const title = document.createElement('div');
+    title.textContent = 'Exporting channel...';
+    title.style.cssText = 'font-weight:700;font-size:15px;margin-bottom:10px;';
+    const phase = document.createElement('div');
+    phase.style.cssText = 'font-size:13px;opacity:0.85;margin-bottom:10px;';
+    const barWrap = document.createElement('div');
+    barWrap.style.cssText = 'height:8px;background:#3a393a;border-radius:4px;overflow:hidden;margin-bottom:14px;';
+    const bar = document.createElement('div');
+    bar.style.cssText = 'height:100%;width:0;background:#36c5f0;transition:width 0.2s;';
+    barWrap.appendChild(bar);
+    const cancelBtn = document.createElement('button');
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.cssText = 'background:#444;color:#fff;border:0;border-radius:6px;padding:7px 14px;cursor:pointer;font-size:13px;';
+    box.appendChild(title); box.appendChild(phase); box.appendChild(barWrap); box.appendChild(cancelBtn);
+    root.appendChild(box);
+    // modal: swallow clicks behind the overlay
+    root.addEventListener('click', (e) => { if (e.target === root) e.stopPropagation(); }, true);
+    document.body.appendChild(root);
+    let cancelCb = null;
+    cancelBtn.addEventListener('click', () => { cancelBtn.disabled = true; cancelBtn.textContent = 'Canceling...'; if (cancelCb) cancelCb(); });
+    return {
+      onCancel(cb) { cancelCb = cb; },
+      setPhase(text) { phase.textContent = text; },
+      setProgress(label, cur, total) {
+        if (total && total > 0) { bar.style.width = Math.round((cur / total) * 100) + '%'; phase.textContent = label + ' ' + cur + ' / ' + total; }
+        else { phase.textContent = label + ' ' + cur + '...'; }
+      },
+      done(text) { title.textContent = 'Export complete'; phase.textContent = text; bar.style.width = '100%'; cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); setTimeout(() => { if (root.parentNode) root.remove(); }, 6000); },
+      fail(text) { title.textContent = 'Export failed'; phase.textContent = text; bar.style.background = '#e01e5a'; cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); },
+      destroy() { if (root.parentNode) root.remove(); },
+    };
+  }
+
+  function phaseLabel(p) {
+    if (p === 'messages') return 'Fetching messages';
+    if (p === 'threads') return 'Fetching threads';
+    if (p === 'thread-page') return 'Fetching thread replies';
+    if (p === 'reactions') return 'Resolving reaction authors';
+    if (p === 'actors') return 'Resolving users';
+    return p;
+  }
+
+  let exportInProgress = false;
+  ipcRenderer.on('slack-autocomplete:export-channel', async () => {
+    if (exportInProgress) return;
+    exportInProgress = true;
+    const overlay = createExportOverlay();
+    const ac = new AbortController();
+    overlay.onCancel(() => ac.abort());
+    let saveToken = null;
+    try {
+      const cfg = getExportConfig();
+      const apiCall = createApiCall(cfg, ac.signal);
+      overlay.setPhase('Reading channel info...');
+      let channel = { id: cfg.channelId, name: cfg.channelId };
+      try {
+        const info = await apiCall('conversations.info', { channel: cfg.channelId });
+        if (info && info.ok && info.channel) channel = info.channel;
+      } catch (e) { /* fall back to id */ }
+      const workspace = exportCore.workspaceFromConfig(cfg.localConfigRaw, cfg.teamId);
+
+      const suggested = 'slack-export-' + (channel.name || cfg.channelId) + '-' + exportTsStamp() + '.json';
+      const begin = await ipcRenderer.invoke('slack-autocomplete:save-export:begin', { suggestedName: suggested });
+      if (begin && begin.canceled) { overlay.destroy(); return; }
+      saveToken = begin.token;
+
+      const exportedAt = new Date().toISOString();
+      const doc = await exportCore.runExport(apiCall, {
+        channelId: cfg.channelId, channel, workspace, exportedAt
+      }, {
+        signal: ac.signal,
+        onProgress: (p, cur, total) => overlay.setProgress(phaseLabel(p), cur, total),
+      });
+
+      overlay.setPhase('Saving file...');
+      for (const chunk of exportCore.streamExportJson(doc)) {
+        await ipcRenderer.invoke('slack-autocomplete:save-export:write', { token: saveToken, chunk });
+      }
+      const res = await ipcRenderer.invoke('slack-autocomplete:save-export:commit', { token: saveToken });
+      overlay.done('Saved to ' + res.path + (doc.export.complete ? '' : ' (incomplete - see export.warnings)'));
+    } catch (e) {
+      if (saveToken) { try { await ipcRenderer.invoke('slack-autocomplete:save-export:abort', { token: saveToken }); } catch (e2) { /* ignore */ } }
+      if (e && e.name === 'AbortError') overlay.done('Export canceled.');
+      else overlay.fail(String((e && e.message) || e));
+    } finally {
+      exportInProgress = false;
+    }
+  });
+  // =================== end channel JSON export ===================
 
   if (document.readyState === 'loading') {
     window.addEventListener('DOMContentLoaded', init);
