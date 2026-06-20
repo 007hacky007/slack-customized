@@ -3022,6 +3022,16 @@ cat > preload.js <<'EOF'
 })();
 EOF
 
+# ---------------------------------------------------------------------------
+# Copy pure export-core module (unit-tested separately) into the app dir
+# ---------------------------------------------------------------------------
+if [[ -f "$SCRIPT_DIR/export-core.js" ]]; then
+  cp "$SCRIPT_DIR/export-core.js" "$APP_DIR/export-core.js"
+  echo "Copied export-core.js"
+else
+  echo "WARNING: export-core.js not found next to the script; export feature will not load." >&2
+fi
+
 echo "Created preload.js"
 
 ICON_ARGS=()
