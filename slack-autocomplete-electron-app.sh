@@ -3223,7 +3223,7 @@ cat > preload.js <<'EOF'
       try {
         const info = await apiCall('conversations.info', { channel: cfg.channelId });
         if (info && info.ok && info.channel) channel = info.channel;
-      } catch (e) { /* fall back to id */ }
+      } catch (e) { if (e && e.name === 'AbortError') throw e; /* fall back to id */ }
       const workspace = exportCore.workspaceFromConfig(cfg.localConfigRaw, cfg.teamId);
 
       const suggested = 'slack-export-' + (channel.name || cfg.channelId) + '-' + exportTsStamp() + '.json';
