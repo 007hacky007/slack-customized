@@ -3109,17 +3109,23 @@ cat > preload.js <<'EOF'
     return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
   }
 
-  function getExportConfig() {
+  function getExportConfig(log) {
+    log = log || function () {};
     const ids = exportCore.parseClientUrl(window.location.pathname);
     if (!ids) throw new Error('Open a channel first (no channel in the URL).');
+    log('url: teamId=' + ids.teamId + ' channelId=' + ids.channelId);
     const raw = window.localStorage.getItem('localConfig_v2');
     const token = exportCore.getTokenForTeam(raw, ids.teamId);
     const apiBase = exportCore.inferApiBase(raw, ids.teamId);
+    log('localConfig_v2 present=' + (!!raw)
+      + ' token=' + (token ? 'found(' + token.length + ' chars)' : 'MISSING')
+      + ' apiBase=' + (apiBase || 'MISSING'));
     if (!token || !apiBase) throw new Error('Could not find the Slack token/config in this workspace.');
     return { teamId: ids.teamId, channelId: ids.channelId, token, apiBase, localConfigRaw: raw };
   }
 
-  function createApiCall(cfg, signal) {
+  function createApiCall(cfg, signal, log) {
+    log = log || function () {};
     const lastAt = {};
     async function spaceFor(method) {
       const tier = exportCore.methodTier(method);
@@ -3131,6 +3137,7 @@ cat > preload.js <<'EOF'
     }
     return async function apiCall(method, params) {
       let attempt = 0;
+      const url = cfg.apiBase + method + '?slack_route=' + encodeURIComponent(cfg.teamId);
       for (;;) {
         if (signal && signal.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
         await spaceFor(method);
@@ -3140,21 +3147,30 @@ cat > preload.js <<'EOF'
           const v = params[k];
           fd.append(k, typeof v === 'boolean' ? String(v) : v);
         }
-        const url = cfg.apiBase + method + '?slack_route=' + encodeURIComponent(cfg.teamId);
+        log('-> ' + method + '  ' + url);
         let resp;
         try {
           resp = await fetch(url, { method: 'POST', body: fd, credentials: 'include', signal });
         } catch (e) {
           if (signal && signal.aborted) throw e;
           attempt++;
-          if (attempt > 5) throw e;
+          log('   fetch ERROR (' + (e && e.name) + '): ' + (e && e.message) + '  [attempt ' + attempt + ']');
+          if (attempt > 2) {
+            const err = new Error(method + ' fetch failed: ' + (e && e.message) + '  (url: ' + url + ')');
+            err.cause = e;
+            throw err;
+          }
           await exportSleep(exportCore.backoffDelay(attempt), signal);
           continue;
         }
-        if (resp.status === 429) { await exportSleep(exportCore.parseRetryAfter(resp.headers.get('retry-after')) * 1000, signal); continue; }
-        if (resp.status >= 500) { attempt++; if (attempt > 5) throw new Error('Slack server error ' + resp.status); await exportSleep(exportCore.backoffDelay(attempt), signal); continue; }
+        log('<- ' + method + '  HTTP ' + resp.status);
+        if (resp.status === 429) { log('   rate-limited; waiting'); await exportSleep(exportCore.parseRetryAfter(resp.headers.get('retry-after')) * 1000, signal); continue; }
+        if (resp.status >= 500) { attempt++; if (attempt > 2) throw new Error('Slack server error ' + resp.status + ' for ' + method); await exportSleep(exportCore.backoffDelay(attempt), signal); continue; }
         const json = await resp.json();
-        if (json && json.ok === false && json.error === 'ratelimited') { await exportSleep(exportCore.parseRetryAfter(resp.headers.get('retry-after')) * 1000, signal); continue; }
+        if (json && json.ok === false) {
+          log('   ' + method + ' ok=false error=' + json.error);
+          if (json.error === 'ratelimited') { await exportSleep(exportCore.parseRetryAfter(resp.headers.get('retry-after')) * 1000, signal); continue; }
+        }
         return json;
       }
     };
@@ -3164,7 +3180,7 @@ cat > preload.js <<'EOF'
     const root = document.createElement('div');
     root.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;font-family:-apple-system,Segoe UI,sans-serif;';
     const box = document.createElement('div');
-    box.style.cssText = 'background:#1d1c1d;color:#fff;min-width:340px;max-width:80vw;padding:20px 22px;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,0.5);';
+    box.style.cssText = 'background:#1d1c1d;color:#fff;min-width:480px;max-width:80vw;padding:20px 22px;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,0.5);';
     const title = document.createElement('div');
     title.textContent = 'Exporting channel...';
     title.style.cssText = 'font-weight:700;font-size:15px;margin-bottom:10px;';
@@ -3175,10 +3191,12 @@ cat > preload.js <<'EOF'
     const bar = document.createElement('div');
     bar.style.cssText = 'height:100%;width:0;background:#36c5f0;transition:width 0.2s;';
     barWrap.appendChild(bar);
+    const logEl = document.createElement('pre');
+    logEl.style.cssText = 'font-size:11px;line-height:1.45;color:#cfd3d6;background:#121212;border-radius:6px;padding:8px 10px;margin:0 0 12px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all;';
     const cancelBtn = document.createElement('button');
     cancelBtn.textContent = 'Cancel';
     cancelBtn.style.cssText = 'background:#444;color:#fff;border:0;border-radius:6px;padding:7px 14px;cursor:pointer;font-size:13px;';
-    box.appendChild(title); box.appendChild(phase); box.appendChild(barWrap); box.appendChild(cancelBtn);
+    box.appendChild(title); box.appendChild(phase); box.appendChild(barWrap); box.appendChild(logEl); box.appendChild(cancelBtn);
     root.appendChild(box);
     // modal: swallow clicks behind the overlay
     root.addEventListener('click', (e) => { if (e.target === root) e.stopPropagation(); }, true);
@@ -3188,11 +3206,18 @@ cat > preload.js <<'EOF'
     return {
       onCancel(cb) { cancelCb = cb; },
       setPhase(text) { phase.textContent = text; },
+      appendLog(line) {
+        const t = new Date();
+        const p2 = (n) => String(n).padStart(2, '0');
+        const ts = p2(t.getHours()) + ':' + p2(t.getMinutes()) + ':' + p2(t.getSeconds());
+        logEl.textContent += '[' + ts + '] ' + line + '\n';
+        logEl.scrollTop = logEl.scrollHeight;
+      },
       setProgress(label, cur, total) {
         if (total && total > 0) { bar.style.width = Math.round((cur / total) * 100) + '%'; phase.textContent = label + ' ' + cur + ' / ' + total; }
         else { phase.textContent = label + ' ' + cur + '...'; }
       },
-      done(text) { title.textContent = 'Export complete'; phase.textContent = text; bar.style.width = '100%'; cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); setTimeout(() => { if (root.parentNode) root.remove(); }, 6000); },
+      done(text) { title.textContent = 'Export complete'; phase.textContent = text; bar.style.width = '100%'; cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); },
       fail(text) { title.textContent = 'Export failed'; phase.textContent = text; bar.style.background = '#e01e5a'; cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); },
       destroy() { if (root.parentNode) root.remove(); },
     };
@@ -3212,40 +3237,58 @@ cat > preload.js <<'EOF'
     if (exportInProgress) return;
     exportInProgress = true;
     const overlay = createExportOverlay();
+    const log = (msg) => { try { console.log('[slack-export]', msg); } catch (e) {} overlay.appendLog(msg); };
     const ac = new AbortController();
-    overlay.onCancel(() => ac.abort());
+    overlay.onCancel(() => { log('cancel requested'); ac.abort(); });
     let saveToken = null;
     try {
-      const cfg = getExportConfig();
-      const apiCall = createApiCall(cfg, ac.signal);
+      log('starting export');
+      const cfg = getExportConfig(log);
+      const apiCall = createApiCall(cfg, ac.signal, log);
       overlay.setPhase('Reading channel info...');
       let channel = { id: cfg.channelId, name: cfg.channelId };
       try {
         const info = await apiCall('conversations.info', { channel: cfg.channelId });
         if (info && info.ok && info.channel) channel = info.channel;
-      } catch (e) { if (e && e.name === 'AbortError') throw e; /* fall back to id */ }
+        log('channel: ' + (channel.name || cfg.channelId));
+      } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
+        log('conversations.info failed (continuing with channel id): ' + (e && e.message));
+      }
       const workspace = exportCore.workspaceFromConfig(cfg.localConfigRaw, cfg.teamId);
 
       const suggested = 'slack-export-' + (channel.name || cfg.channelId) + '-' + exportTsStamp() + '.json';
+      log('choosing save destination...');
       const begin = await ipcRenderer.invoke('slack-autocomplete:save-export:begin', { suggestedName: suggested });
-      if (begin && begin.canceled) { overlay.destroy(); return; }
+      if (begin && begin.canceled) { log('save dialog canceled'); overlay.destroy(); return; }
       saveToken = begin.token;
 
       const exportedAt = new Date().toISOString();
+      let lastPhase = null;
       const doc = await exportCore.runExport(apiCall, {
         channelId: cfg.channelId, channel, workspace, exportedAt
       }, {
         signal: ac.signal,
-        onProgress: (p, cur, total) => overlay.setProgress(phaseLabel(p), cur, total),
+        onProgress: (p, cur, total) => {
+          overlay.setProgress(phaseLabel(p), cur, total);
+          if (p !== lastPhase) { lastPhase = p; log(phaseLabel(p) + '...'); }
+        },
       });
+      log('assembled: ' + doc.export.counts.messages + ' messages, '
+        + doc.export.counts.replies + ' replies, '
+        + doc.export.counts.reactions + ' reactions, '
+        + Object.keys(doc.users || {}).length + ' users; complete=' + doc.export.complete);
 
       overlay.setPhase('Saving file...');
+      log('writing file...');
       for (const chunk of exportCore.streamExportJson(doc)) {
         await ipcRenderer.invoke('slack-autocomplete:save-export:write', { token: saveToken, chunk });
       }
       const res = await ipcRenderer.invoke('slack-autocomplete:save-export:commit', { token: saveToken });
+      log('saved: ' + res.path);
       overlay.done('Saved to ' + res.path + (doc.export.complete ? '' : ' (incomplete - see export.warnings)'));
     } catch (e) {
+      log('FAILED: ' + ((e && e.message) || e));
       if (saveToken) { try { await ipcRenderer.invoke('slack-autocomplete:save-export:abort', { token: saveToken }); } catch (e2) { /* ignore */ } }
       if (e && e.name === 'AbortError') overlay.done('Export canceled.');
       else overlay.fail(String((e && e.message) || e));
