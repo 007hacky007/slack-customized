@@ -1071,13 +1071,28 @@ ipcMain.handle('slack-autocomplete:api-call', async (event, payload = {}) => {
   if (!isSlackSender(event)) throw new Error('api-call rejected: untrusted sender');
   const { apiBase, teamId, token, method, params } = payload;
   if (typeof apiBase !== 'string' || typeof method !== 'string') throw new Error('api-call: bad arguments');
+  // Harden against SSRF / credential exfiltration: the renderer supplies apiBase + method,
+  // and this request carries the auth token + session cookies. Confine the destination to
+  // Slack hosts and a well-formed method name, and build the URL via the URL parser (no
+  // string concatenation) so a compromised renderer cannot point it at an arbitrary host.
+  if (!/^[a-zA-Z][a-zA-Z0-9._]*$/.test(method)) throw new Error('api-call: bad method');
+  let url;
+  try {
+    url = new URL(method, apiBase);
+  } catch (e) {
+    throw new Error('api-call: bad apiBase');
+  }
+  const host = url.hostname.replace(/\.$/, '');
+  if (url.protocol !== 'https:' || !/^([a-z0-9-]+\.)*slack\.com$/i.test(host)) {
+    throw new Error('api-call: host not permitted');
+  }
+  url.searchParams.set('slack_route', String(teamId || ''));
   const body = new URLSearchParams();
   body.append('token', token);
   for (const [k, v] of Object.entries(params || {})) {
     body.append(k, typeof v === 'boolean' ? String(v) : String(v));
   }
-  const url = apiBase + method + '?slack_route=' + encodeURIComponent(teamId || '');
-  const resp = await net.fetch(url, {
+  const resp = await net.fetch(url.toString(), {
     method: 'POST',
     body,
     credentials: 'include',
