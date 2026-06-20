@@ -126,3 +126,23 @@ test('createReport tracks counts, warnings, completeness', () => {
     { type: 'actor_unresolved', id: 'U9', kind: 'user' },
   ]);
 });
+
+test('methodTier and tierIntervalMs map methods to limits', () => {
+  assert.equal(core.methodTier('conversations.history'), 'history');
+  assert.equal(core.methodTier('conversations.replies'), 'history');
+  assert.equal(core.methodTier('reactions.get'), 'reactions');
+  assert.equal(core.methodTier('users.info'), 'users');
+  assert.equal(core.methodTier('bots.info'), 'users');
+  assert.equal(core.methodTier('conversations.info'), 'info');
+  assert.equal(core.methodTier('something.else'), 'default');
+  assert.equal(core.tierIntervalMs('reactions.get'), core.TIERS.reactions);
+});
+
+test('parseRetryAfter and backoffDelay', () => {
+  assert.equal(core.parseRetryAfter('30'), 30);
+  assert.equal(core.parseRetryAfter(null), 5);
+  assert.equal(core.parseRetryAfter('garbage'), 5);
+  assert.equal(core.backoffDelay(1), 1000);
+  assert.equal(core.backoffDelay(2), 2000);
+  assert.ok(core.backoffDelay(20) <= 30000);
+});

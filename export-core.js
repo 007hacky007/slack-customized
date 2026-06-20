@@ -157,8 +157,26 @@ function createReport() {
   };
 }
 
+const TIERS = { history: 1200, reactions: 3000, users: 600, info: 1200, default: 1200 };
+
+function methodTier(method) {
+  if (method === 'conversations.history' || method === 'conversations.replies') return 'history';
+  if (method === 'reactions.get') return 'reactions';
+  if (method === 'users.info' || method === 'bots.info') return 'users';
+  if (method === 'conversations.info' || method === 'conversations.genericInfo') return 'info';
+  return 'default';
+}
+function tierIntervalMs(method) { return TIERS[methodTier(method)] || TIERS.default; }
+
+function parseRetryAfter(value) {
+  const n = parseInt(value, 10);
+  return (isFinite(n) && n >= 0) ? n : 5;
+}
+function backoffDelay(attempt) { return Math.min(30000, 500 * Math.pow(2, attempt)); }
+
 module.exports = {
   parseClientUrl, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
+  TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay,
 };
