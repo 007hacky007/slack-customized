@@ -146,3 +146,23 @@ test('parseRetryAfter and backoffDelay', () => {
   assert.equal(core.backoffDelay(2), 2000);
   assert.ok(core.backoffDelay(20) <= 30000);
 });
+
+test('streamExportJson round-trips to the same document', () => {
+  const doc = {
+    export: { version: 1, complete: true },
+    workspace: { team_id: 'T1', name: 'W' },
+    channel: { id: 'C1', name: 'general' },
+    users: { U1: { id: 'U1', name: 'John' } },
+    messages: [{ ts: '1.0', text: 'a' }, { ts: '2.0', text: 'b' }],
+  };
+  let out = '';
+  for (const chunk of core.streamExportJson(doc)) out += chunk;
+  assert.deepEqual(JSON.parse(out), doc);
+});
+
+test('streamExportJson handles empty messages', () => {
+  const doc = { export: {}, workspace: {}, channel: {}, users: {}, messages: [] };
+  let out = '';
+  for (const chunk of core.streamExportJson(doc)) out += chunk;
+  assert.deepEqual(JSON.parse(out), doc);
+});

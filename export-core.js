@@ -174,9 +174,23 @@ function parseRetryAfter(value) {
 }
 function backoffDelay(attempt) { return Math.min(30000, 500 * Math.pow(2, attempt)); }
 
+function* streamExportJson(doc) {
+  yield '{\n';
+  yield '"export":' + JSON.stringify(doc.export) + ',\n';
+  yield '"workspace":' + JSON.stringify(doc.workspace) + ',\n';
+  yield '"channel":' + JSON.stringify(doc.channel) + ',\n';
+  yield '"users":' + JSON.stringify(doc.users) + ',\n';
+  yield '"messages":[\n';
+  const arr = doc.messages || [];
+  for (let i = 0; i < arr.length; i++) {
+    yield JSON.stringify(arr[i]) + (i < arr.length - 1 ? ',\n' : '\n');
+  }
+  yield ']\n}\n';
+}
+
 module.exports = {
   parseClientUrl, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
-  TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay,
+  TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson,
 };
