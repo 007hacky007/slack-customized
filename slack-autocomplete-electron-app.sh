@@ -3129,10 +3129,39 @@ cat > preload.js <<'EOF'
   function setupBadgeUpdater() {
     const COUNTS_POLL_INTERVAL_MS = 30000;
     const COUNTS_FRESH_MS = 90000;
+    const COUNTS_REFRESH_DEBOUNCE_MS = 1000;
     let lastCountsAt = 0;
+    let countsMentions = 0;
+    let refreshHandle = null;
 
-    // Exact badge: poll the same client.counts API the official client uses.
-    // The title-parsing heuristic below stays as a fallback while counts are stale.
+    // The window title is the instant source of truth for WHETHER anything is
+    // unread (it clears the moment you read); client.counts only refines the
+    // mention number, since its has_unreads also covers muted channels.
+    const parseTitle = () => {
+      const title = document.title;
+      const suffixMatch = title.match(/-\s*(\d+)\s*new\s*items?\s*-\s*Slack\s*$/i);
+      const prefixMatch = title.match(/^\((\d+)\)/);
+      return {
+        count: suffixMatch ? suffixMatch[1] : (prefixMatch ? prefixMatch[1] : ''),
+        dot: !suffixMatch && !prefixMatch && (title.startsWith('!') || title.startsWith('*')),
+      };
+    };
+
+    const applyBadge = () => {
+      const t = parseTitle();
+      let badge = '';
+      if (t.count || t.dot) {
+        const countsFresh = Date.now() - lastCountsAt < COUNTS_FRESH_MS;
+        if (countsFresh && countsMentions > 0) badge = String(countsMentions);
+        else badge = t.count || '•';
+      }
+      if (ipcRenderer) {
+        ipcRenderer.invoke('slack-autocomplete:update-badge', badge).catch((err) => {
+          log('Failed to update badge', err);
+        });
+      }
+    };
+
     const pollCounts = async () => {
       try {
         const teamId = exportCore.parseClientTeam(window.location.pathname)?.teamId;
@@ -3143,12 +3172,11 @@ cat > preload.js <<'EOF'
         const res = await ipcRenderer.invoke('slack-autocomplete:api-call', {
           apiBase, teamId, token, method: 'client.counts', params: {}
         });
-        const badge = exportCore.computeBadgeFromCounts(res?.json);
-        if (badge === null) return; // API refused; keep title fallback active
+        const summary = exportCore.summarizeCounts(res?.json);
+        if (!summary) return; // API refused; title heuristic stays in charge
         lastCountsAt = Date.now();
-        ipcRenderer.invoke('slack-autocomplete:update-badge', badge).catch((err) => {
-          log('Failed to update badge', err);
-        });
+        countsMentions = summary.mentions;
+        applyBadge();
       } catch (err) {
         log('client.counts poll failed', err);
       }
@@ -3156,36 +3184,15 @@ cat > preload.js <<'EOF'
     setInterval(pollCounts, COUNTS_POLL_INTERVAL_MS);
     setTimeout(pollCounts, 5000);
 
-    const updateBadge = () => {
-      if (Date.now() - lastCountsAt < COUNTS_FRESH_MS) return;
-      const title = document.title;
-      let badge = '';
-
-      // 1. Check for " - N new items - Slack" suffix (User reported format)
-      const suffixMatch = title.match(/-\s*(\d+)\s*new\s*items?\s*-\s*Slack\s*$/i);
-
-      // 2. Check for "(N)" prefix (Standard Slack mentions)
-      const prefixMatch = title.match(/^\((\d+)\)/);
-
-      if (suffixMatch) {
-        badge = suffixMatch[1];
-      } else if (prefixMatch) {
-        badge = prefixMatch[1];
-      } else if (title.startsWith('!') || title.startsWith('*')) {
-        // 3. Fallback for unread activity without count
-        badge = '•';
-      }
-
-      if (ipcRenderer) {
-        ipcRenderer.invoke('slack-autocomplete:update-badge', badge).catch((err) => {
-          log('Failed to update badge', err);
-        });
-      }
+    const onTitleChange = () => {
+      applyBadge(); // instant: clears the badge as soon as everything is read
+      if (refreshHandle) clearTimeout(refreshHandle);
+      refreshHandle = setTimeout(pollCounts, COUNTS_REFRESH_DEBOUNCE_MS);
     };
 
     const titleEl = document.querySelector('title');
     if (titleEl) {
-      const observer = new MutationObserver(updateBadge);
+      const observer = new MutationObserver(onTitleChange);
       observer.observe(titleEl, {
         childList: true,
         characterData: true,
@@ -3194,7 +3201,7 @@ cat > preload.js <<'EOF'
     }
 
     // Initial check
-    updateBadge();
+    applyBadge();
   }
 
   function installIdleDetector() {

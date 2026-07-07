@@ -263,9 +263,9 @@ function extractNotificationTarget(options) {
   return channel ? { channel, ts, threadTs } : null;
 }
 
-// Turns a client.counts response into dock-badge text: mention total,
-// unread dot, or empty. Tolerant of shape drift in the undocumented API.
-function computeBadgeFromCounts(counts) {
+// Summarizes a client.counts response. Tolerant of shape drift in the
+// undocumented API. Returns null when the response is unusable.
+function summarizeCounts(counts) {
   if (!counts || counts.ok === false) return null;
   let mentions = 0;
   let unread = false;
@@ -281,8 +281,14 @@ function computeBadgeFromCounts(counts) {
     mentions += counts.threads.mention_count | 0;
     if (counts.threads.has_unreads) unread = true;
   }
-  if (mentions > 0) return String(mentions);
-  return unread ? '•' : '';
+  return { mentions, hasUnreads: unread };
+}
+
+function computeBadgeFromCounts(counts) {
+  const s = summarizeCounts(counts);
+  if (!s) return null;
+  if (s.mentions > 0) return String(s.mentions);
+  return s.hasUnreads ? '•' : '';
 }
 
 function normalizeChannelTypes(types) {
@@ -492,7 +498,7 @@ async function runExport(apiCall, ctx, hooks) {
 module.exports = {
   parseClientUrl, parseClientTeam, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
   normalizeChannelTypes, channelTypesLabel, fetchAllMemberChannels, buildChannelListDoc, formatChannelListText,
-  extractNotificationTarget, computeBadgeFromCounts,
+  extractNotificationTarget, summarizeCounts, computeBadgeFromCounts,
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
   TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory, fetchThreadReplies,

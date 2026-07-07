@@ -415,3 +415,15 @@ test('computeBadgeFromCounts sums mentions, falls back to unread dot', () => {
   assert.equal(core.computeBadgeFromCounts({ ok: false, error: 'invalid_auth' }), null);
   assert.equal(core.computeBadgeFromCounts(null), null);
 });
+
+test('summarizeCounts returns mention totals and unread flag', () => {
+  assert.deepEqual(core.summarizeCounts({
+    ok: true,
+    channels: [{ id: 'C1', mention_count: 2, has_unreads: true }],
+    ims: [{ id: 'D1', dm_count: 1 }],
+    threads: { mention_count: 1 },
+  }), { mentions: 4, hasUnreads: true });
+  assert.deepEqual(core.summarizeCounts({ ok: true }), { mentions: 0, hasUnreads: false });
+  assert.equal(core.summarizeCounts({ ok: false }), null);
+  assert.equal(core.summarizeCounts(undefined), null);
+});
