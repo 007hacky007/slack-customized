@@ -951,9 +951,9 @@ function attachWindowStateTracking(win, initialUrl = SLACK_URL) {
   scheduleWindowStateSave();
 }
 
-function buildWindowOptions(overrides) {
+function buildWindowOptions(overrides, extraArguments) {
   const iconImage = getIconImage();
-  return Object.assign({
+  const base = {
     width: 1200,
     height: 800,
     icon: iconImage,
@@ -964,12 +964,19 @@ function buildWindowOptions(overrides) {
       sandbox: false,
       nativeWindowOpen: true
     }
-  }, overrides || {});
+  };
+  if (Array.isArray(extraArguments) && extraArguments.length) {
+    base.webPreferences.additionalArguments = extraArguments;
+  }
+  return Object.assign(base, overrides || {});
 }
 
-// Thread pop-outs open as slim windows showing only the thread (the preload
-// hides the rest of the client when it sees the marker), like the official app.
-const THREAD_POPOUT_MARKER = 'saw-thread-popout';
+// Thread pop-outs open as slim windows showing only the thread. The pop-out
+// flag is passed as a renderer process argument (readable in the preload via
+// process.argv) instead of a URL fragment: Slack's client router rewrites the
+// URL and strips the hash within a second of load, so a fragment marker is
+// unreliable - the process argument survives all navigation.
+const THREAD_POPOUT_ARG = '--saw-thread-popout';
 
 function isThreadUrl(targetUrl) {
   try {
@@ -979,10 +986,25 @@ function isThreadUrl(targetUrl) {
   }
 }
 
+// A fresh window cannot cold-load a /thread/ deep link (Slack shows an error
+// page - the client must boot on a workspace/channel route first). So the
+// pop-out boots at the channel URL and the preload opens the thread client-
+// side once booted; the thread URL is passed as a renderer process argument.
+function threadUrlToChannelUrl(threadUrl) {
+  try {
+    const u = new URL(threadUrl);
+    u.pathname = u.pathname.replace(/\/thread\/.*$/, '');
+    u.hash = '';
+    u.search = '';
+    return u.toString();
+  } catch (err) {
+    return threadUrl;
+  }
+}
+
 function openThreadPopout(targetUrl) {
-  let u = String(targetUrl);
-  if (!u.includes(THREAD_POPOUT_MARKER)) u += '#' + THREAD_POPOUT_MARKER;
-  return createWindow(u, { width: 520, height: 780 });
+  const channelUrl = threadUrlToChannelUrl(targetUrl);
+  return createWindow(channelUrl, { width: 520, height: 780 }, [THREAD_POPOUT_ARG, '--saw-thread-url=' + String(targetUrl)]);
 }
 
 function triggerDownload(url) {
@@ -1245,8 +1267,8 @@ function installHideOnClose(win) {
   });
 }
 
-function createWindow(initialUrl = SLACK_URL, windowOverrides) {
-  const win = new BrowserWindow(buildWindowOptions(windowOverrides));
+function createWindow(initialUrl = SLACK_URL, windowOverrides, extraArguments) {
+  const win = new BrowserWindow(buildWindowOptions(windowOverrides, extraArguments));
   applyWindowPolicies(win);
   installHideOnClose(win);
   win.loadURL(initialUrl);
@@ -1681,13 +1703,22 @@ cat > preload.js <<'EOF'
       return false;
     }
   })();
-  // Thread pop-out windows (marker set by the main process) show only the
+  // Thread pop-out windows are flagged by the main process via a renderer
+  // process argument (survives Slack's URL/hash rewriting). Shows only the
   // thread pane, like the official app's thread windows.
   const THREAD_POPOUT_MODE = (() => {
     try {
-      return window.location.hash.includes('saw-thread-popout');
+      return process.argv.includes('--saw-thread-popout');
     } catch (err) {
       return false;
+    }
+  })();
+  const THREAD_POPOUT_URL = (() => {
+    try {
+      const a = (process.argv || []).find((x) => typeof x === 'string' && x.indexOf('--saw-thread-url=') === 0);
+      return a ? a.slice('--saw-thread-url='.length) : null;
+    } catch (err) {
+      return null;
     }
   })();
   const CHANNEL_CONTEXT_TTL = 4000;
@@ -2379,13 +2410,28 @@ cat > preload.js <<'EOF'
   // client puts its "Open in new window" inside its own menu the same way).
   let pendingThreadContext = null;
 
+  // Reliable thread URL from the pane's own DOM: thread list items carry ids
+  // like "C0AB12CDE-1783109507.888099-thread-list-Thread" (verified live).
+  // This does not depend on the cached thread context or the address bar
+  // (which shows the channel, not the thread, while a thread pane is open).
+  function threadUrlFromPane(pane) {
+    if (!pane) return null;
+    const el = pane.querySelector('[id*="-thread-list-Thread"]') || pane.querySelector('[id*="/thread/"]');
+    const m = el && /([CDG][A-Z0-9]+)-(\d+\.\d+)/.exec(el.id);
+    if (!m) return null;
+    const teamId = exportCore.parseClientTeam(window.location.pathname)?.teamId;
+    if (!teamId) return null;
+    return `${window.location.origin}/client/${teamId}/${m[1]}/thread/${m[1]}-${m[2]}`;
+  }
+
   function captureThreadContext(event) {
     pendingThreadContext = null;
     if (THREAD_POPOUT_MODE) return; // no pop-out from inside a pop-out
     if (!(event.target instanceof Element)) return;
-    if (!event.target.closest(THREAD_PANE_SELECTORS)) return;
-    let url = null;
-    try { url = getCurrentThreadUrl(false); } catch (err) { url = null; }
+    const pane = event.target.closest(THREAD_PANE_SELECTORS);
+    if (!pane) return;
+    let url = threadUrlFromPane(pane);
+    if (!url) { try { url = getCurrentThreadUrl(true); } catch (err) { url = null; } }
     if (!url || !url.includes('/thread/')) return;
     pendingThreadContext = { url, ts: Date.now() };
     requestMenuScan();
@@ -3686,11 +3732,17 @@ cat > preload.js <<'EOF'
     exposeDebugHelpers();
   }
 
-  // Thread-only pop-out: isolate the thread pane by hiding its siblings all
-  // the way up the tree. Unlike a class-name CSS approach this survives
-  // Slack renaming classes - we only need to FIND the pane, not know the
-  // layout around it. Overlays mounted directly on <body> (menus, modals)
-  // are left alone so Slack dialogs still work.
+  // Thread-only pop-out. Verified against the live Slack DOM: the client uses
+  // a CSS grid layout with `display:contents` wrappers, so the thread sits in
+  // a fixed-width (~440px) grid track. Two moves are both required:
+  //   1. Hide every ancestor sibling up to <body> - kills the rail, workspace
+  //      switcher and the primary channel view (which paint over the thread
+  //      because they live in sibling stacking contexts, so z-index alone
+  //      can't cover them).
+  //   2. position:fixed the pane to fill the viewport - escapes the grid track
+  //      that otherwise pins it to ~440px.
+  // This is layout-name-agnostic (only the pane must be found) and re-applied
+  // because React re-renders drop our inline styles.
   const THREAD_PANE_SELECTORS = [
     '[data-qa="threads_flexpane"]',
     '.p-thread_view',
@@ -3712,20 +3764,37 @@ cat > preload.js <<'EOF'
         if (sib.tagName === 'SCRIPT' || sib.tagName === 'STYLE' || sib.tagName === 'LINK') continue;
         sib.style.setProperty('display', 'none', 'important');
       }
-      node.style.setProperty('width', '100%', 'important');
-      node.style.setProperty('max-width', 'none', 'important');
-      node.style.setProperty('height', '100%', 'important');
-      node.style.setProperty('flex', '1 1 auto', 'important');
       node = parent;
     }
+    const bg = getComputedStyle(document.body).backgroundColor;
+    pane.style.setProperty('position', 'fixed', 'important');
+    pane.style.setProperty('inset', '0', 'important');
+    pane.style.setProperty('width', '100vw', 'important');
+    pane.style.setProperty('height', '100vh', 'important');
+    pane.style.setProperty('max-width', 'none', 'important');
+    pane.style.setProperty('background', (bg && bg !== 'rgba(0, 0, 0, 0)') ? bg : '#1a1d21', 'important');
     return true;
   }
 
   function applyThreadPopoutMode() {
-    // Re-apply forever: Slack's React re-renders recreate nodes without our
-    // inline styles, so a one-shot pass would slowly un-hide the client.
-    isolateThreadPane();
-    setInterval(isolateThreadPane, 1000);
+    document.documentElement.classList.add('saw-thread-popout');
+    // The window boots on the channel route; open the thread client-side once
+    // the client is up (setting location to the thread URL opens the pane).
+    // Retry until the pane appears, then keep isolating (React re-renders drop
+    // our inline styles).
+    let openAttempts = 0;
+    const tick = () => {
+      const pane = document.querySelector(THREAD_PANE_SELECTORS);
+      if (!pane && THREAD_POPOUT_URL && openAttempts < 12) {
+        openAttempts++;
+        try { window.location.assign(THREAD_POPOUT_URL); } catch (err) { /* ignore */ }
+        return;
+      }
+      if (pane) isolateThreadPane();
+    };
+    // Give the client a moment to boot before the first open attempt.
+    [1500, 2200, 3000, 4000, 5000].forEach((ms) => setTimeout(tick, ms));
+    setInterval(tick, 1200);
   }
 
   // ===================== Downloads panel (official-style pane) =====================
