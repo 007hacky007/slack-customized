@@ -957,6 +957,9 @@ function buildWindowOptions(overrides, extraArguments) {
     width: 1200,
     height: 800,
     icon: iconImage,
+    // Official-app look: no native title bar; the traffic lights sit inside
+    // the Slack UI (the preload pads Slack's top nav to make room for them).
+    ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' } : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -1288,6 +1291,10 @@ ipcMain.handle('slack-autocomplete:open-window', async (_event, targetUrl) => {
 
   if (isThreadUrl(targetUrl)) {
     openThreadPopout(targetUrl);
+  } else if (isSlackAppNavigationUrl(targetUrl)) {
+    // Channel "Open in new window": official shows just the channel view
+    // (no rail/sidebar/top nav) - the preload isolates it via this flag.
+    createWindow(targetUrl, undefined, ['--saw-channel-popout']);
   } else {
     createWindow(targetUrl);
   }
@@ -1720,6 +1727,17 @@ cat > preload.js <<'EOF'
     } catch (err) {
       return null;
     }
+  })();
+  // Channel pop-out windows show just the channel view (official-app style).
+  const CHANNEL_POPOUT_MODE = (() => {
+    try {
+      return process.argv.includes('--saw-channel-popout');
+    } catch (err) {
+      return false;
+    }
+  })();
+  const IS_MAC_PRELOAD = (() => {
+    try { return process.platform === 'darwin'; } catch (err) { return false; }
   })();
   const CHANNEL_CONTEXT_TTL = 4000;
   const LISTBOX_SCAN_INTERVAL_MS = 140;
@@ -2461,7 +2479,7 @@ cat > preload.js <<'EOF'
 
     const label = document.createElement('div');
     label.className = 'c-menu_item__label';
-    label.textContent = 'Open thread in new window';
+    label.textContent = pendingThreadContext.label || 'Open thread in new window';
 
     button.appendChild(label);
     wrapper.appendChild(button);
@@ -2538,8 +2556,17 @@ cat > preload.js <<'EOF'
       requestAnimationFrame(closeContextMenus);
     });
 
-    normalizedMenu.appendChild(wrapper);
-    normalizedMenu.appendChild(separator);
+    // Official placement: own section right before "Leave channel".
+    const leaveItem = Array.from(normalizedMenu.querySelectorAll('.c-menu_item__li')).find(
+      (li) => /^leave\s/i.test((li.textContent || '').trim())
+    );
+    if (leaveItem) {
+      normalizedMenu.insertBefore(wrapper, leaveItem);
+      normalizedMenu.insertBefore(separator, leaveItem);
+    } else {
+      normalizedMenu.appendChild(wrapper);
+      normalizedMenu.appendChild(separator);
+    }
     log('Inserted custom "Open in new window" channel action.');
   }
 
@@ -2571,6 +2598,20 @@ cat > preload.js <<'EOF'
   function setupChannelContextMenuSupport() {
     document.addEventListener('contextmenu', captureChannelContext, true);
     document.addEventListener('contextmenu', captureThreadContext, true);
+    // Thread header "..." menu gets "Open in new window", matching where the
+    // official app puts it.
+    document.addEventListener('click', (event) => {
+      if (THREAD_POPOUT_MODE) return;
+      if (!(event.target instanceof Element)) return;
+      const moreBtn = event.target.closest('[data-qa="secondary-header-more"]');
+      if (!moreBtn) return;
+      const pane = moreBtn.closest(THREAD_PANE_SELECTORS);
+      if (!pane) return;
+      const url = threadUrlFromPane(pane);
+      if (!url) return;
+      pendingThreadContext = { url, ts: Date.now(), label: 'Open in new window' };
+      requestMenuScan();
+    }, true);
 
     if (menuObserver) {
       menuObserver.disconnect();
@@ -3720,8 +3761,12 @@ cat > preload.js <<'EOF'
     setupAttachmentEscape();
     if (THREAD_POPOUT_MODE) {
       applyThreadPopoutMode();
+    } else if (CHANNEL_POPOUT_MODE) {
+      applyChannelPopoutMode();
+      setupThreadWatcher(); // threads can still pop out from a channel window
     } else {
-      setupThreadWatcher(); // no pop-out button inside a pop-out window
+      applyHiddenTitleBarPadding();
+      setupThreadWatcher(); // no pop-out button inside a thread pop-out window
     }
     setupBadgeUpdater();
     setupDownloadsPanel();
@@ -3750,12 +3795,10 @@ cat > preload.js <<'EOF'
     '.p-workspace__secondary_view',
     '.p-flexpane'
   ].join(', ');
+  const CHANNEL_PANE_SELECTORS = '.p-view_contents--primary, .p-workspace__primary_view';
   let threadPopoutPaneMatch = null;
 
-  function isolateThreadPane() {
-    const pane = document.querySelector(THREAD_PANE_SELECTORS);
-    if (!pane) return false;
-    threadPopoutPaneMatch = pane.getAttribute('data-qa') || pane.className || pane.tagName;
+  function isolatePaneElement(pane) {
     let node = pane;
     while (node && node.parentElement && node.parentElement !== document.body && node !== document.body) {
       const parent = node.parentElement;
@@ -3776,8 +3819,31 @@ cat > preload.js <<'EOF'
     return true;
   }
 
+  function isolateThreadPane() {
+    const pane = document.querySelector(THREAD_PANE_SELECTORS);
+    if (!pane) return false;
+    threadPopoutPaneMatch = pane.getAttribute('data-qa') || pane.className || pane.tagName;
+    return isolatePaneElement(pane);
+  }
+
+  // Pop-out chrome polish (official-app parity): no back chevron / close-pane
+  // X in thread windows, and room for the traffic lights (hiddenInset title
+  // bar) in the pane header, which doubles as the window drag area.
+  function installPopoutChromeStyle(rootClass, headerSelector) {
+    const style = document.createElement('style');
+    style.textContent = [
+      `html.${rootClass} [data-qa="close_flexpane"],`,
+      `html.${rootClass} [data-qa="flexpane_back"],`,
+      `html.${rootClass} .p-flexpane_header button[aria-label="Back"] { display: none !important; }`,
+      IS_MAC_PRELOAD ? `html.${rootClass} ${headerSelector} { padding-left: 72px !important; -webkit-app-region: drag; }` : '',
+      IS_MAC_PRELOAD ? `html.${rootClass} ${headerSelector} button, html.${rootClass} ${headerSelector} a, html.${rootClass} ${headerSelector} [role="button"] { -webkit-app-region: no-drag; }` : ''
+    ].join('\n');
+    (document.head || document.documentElement).appendChild(style);
+  }
+
   function applyThreadPopoutMode() {
     document.documentElement.classList.add('saw-thread-popout');
+    installPopoutChromeStyle('saw-thread-popout', '.p-flexpane_header');
     // The window boots on the channel route; open the thread client-side once
     // the client is up (setting location to the thread URL opens the pane).
     // Retry until the pane appears, then keep isolating (React re-renders drop
@@ -3795,6 +3861,30 @@ cat > preload.js <<'EOF'
     // Give the client a moment to boot before the first open attempt.
     [1500, 2200, 3000, 4000, 5000].forEach((ms) => setTimeout(tick, ms));
     setInterval(tick, 1200);
+  }
+
+  function applyChannelPopoutMode() {
+    document.documentElement.classList.add('saw-channel-popout');
+    installPopoutChromeStyle('saw-channel-popout', '.p-view_header, [data-qa="channel_header"]');
+    const tick = () => {
+      const pane = document.querySelector(CHANNEL_PANE_SELECTORS);
+      if (pane) isolatePaneElement(pane);
+    };
+    [1500, 2500, 4000].forEach((ms) => setTimeout(tick, ms));
+    setInterval(tick, 1200);
+  }
+
+  // hiddenInset title bar in regular windows: pad Slack's top nav so its
+  // leftmost controls aren't covered by the macOS traffic lights, and make it
+  // the window drag strip (like the official app's own title area).
+  function applyHiddenTitleBarPadding() {
+    if (!IS_MAC_PRELOAD) return;
+    const style = document.createElement('style');
+    style.textContent = [
+      '.p-ia4_top_nav { padding-left: 72px !important; -webkit-app-region: drag; }',
+      '.p-ia4_top_nav button, .p-ia4_top_nav a, .p-ia4_top_nav input, .p-ia4_top_nav [role="button"], .p-ia4_top_nav [role="search"] { -webkit-app-region: no-drag; }'
+    ].join('\n');
+    (document.head || document.documentElement).appendChild(style);
   }
 
   // ===================== Downloads panel (official-style pane) =====================
