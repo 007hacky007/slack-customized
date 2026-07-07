@@ -162,6 +162,7 @@ const GPU_SWITCHES = [
   ['enable-features', 'Metal,CanvasOopRasterization']
 ];
 const ACTIVE_NOTIFICATIONS = new Map();
+const NOTIFICATION_TAGS = new Map();
 const IS_MAC = process.platform === 'darwin';
 let isQuitting = false;
 const pendingDeepLinks = [];
@@ -965,10 +966,33 @@ ipcMain.handle('slack-autocomplete:notify', async (event, payload = {}) => {
     timeoutType: options.requireInteraction ? 'never' : 'default',
     icon: getIconImage()
   };
+  if (process.platform === 'darwin' && options.hasReply) {
+    notificationOptions.hasReply = true;
+    notificationOptions.replyPlaceholder = typeof options.replyPlaceholder === 'string' && options.replyPlaceholder
+      ? options.replyPlaceholder
+      : 'Reply...';
+  }
 
   const notification = new Notification(notificationOptions);
   const contentsId = event.sender.id;
   const key = `${contentsId}:${id}`;
+
+  // Replace-by-tag (like the DOM Notification `tag` semantics the official
+  // client relies on): a new notification for the same conversation closes
+  // the previous banner instead of stacking a duplicate.
+  const tag = typeof options.tag === 'string' && options.tag ? options.tag : null;
+  const tagKey = tag ? `${contentsId}:tag:${tag}` : null;
+  if (tagKey) {
+    const previousKey = NOTIFICATION_TAGS.get(tagKey);
+    if (previousKey) {
+      const previous = ACTIVE_NOTIFICATIONS.get(previousKey);
+      if (previous) {
+        try { previous.close(); } catch (err) { /* ignore */ }
+        ACTIVE_NOTIFICATIONS.delete(previousKey);
+      }
+    }
+    NOTIFICATION_TAGS.set(tagKey, key);
+  }
   ACTIVE_NOTIFICATIONS.set(key, notification);
 
   notification.on('click', () => {
@@ -980,9 +1004,16 @@ ipcMain.handle('slack-autocomplete:notify', async (event, payload = {}) => {
     }
   });
 
+  notification.on('reply', (_replyEvent, reply) => {
+    sendNotificationEvent(contentsId, { id, type: 'reply', reply: String(reply || '') });
+    ACTIVE_NOTIFICATIONS.delete(key);
+    if (tagKey && NOTIFICATION_TAGS.get(tagKey) === key) NOTIFICATION_TAGS.delete(tagKey);
+  });
+
   notification.on('close', () => {
     sendNotificationEvent(contentsId, { id, type: 'close' });
     ACTIVE_NOTIFICATIONS.delete(key);
+    if (tagKey && NOTIFICATION_TAGS.get(tagKey) === key) NOTIFICATION_TAGS.delete(tagKey);
   });
 
   try {
@@ -1394,6 +1425,12 @@ cat > preload.js <<'EOF'
         this.badge = options.badge || null;
         this.image = options.image || null;
         this.__id = `${this.timestamp}-${Math.random().toString(16).slice(2)}`;
+        // Conversation id + ts recovered from the options Slack's client passed in;
+        // when found, the banner gets a native inline Reply field (like the official app).
+        this.__target = exportCore.extractNotificationTarget({ tag: this.tag, data: this.data, options });
+        if (DEBUG) {
+          try { log('Notification options', JSON.stringify(options), 'target', JSON.stringify(this.__target)); } catch (err) { /* ignore */ }
+        }
 
         notificationRegistry.set(this.__id, this);
 
@@ -1407,7 +1444,8 @@ cat > preload.js <<'EOF'
               requireInteraction: this.requireInteraction,
               subtitle: options.subtitle,
               urgency: options.urgency,
-              tag: this.tag
+              tag: this.tag,
+              hasReply: Boolean(this.__target)
             }
           })
           .catch((err) => {
@@ -1439,9 +1477,43 @@ cat > preload.js <<'EOF'
     window.Notification = SlackAutocompleteNotification;
     notificationBridgeInstalled = true;
 
+    async function postNotificationReply(instance, text) {
+      const target = instance.__target;
+      const reply = String(text || '').trim();
+      if (!target || !reply) return;
+      try {
+        const teamId = exportCore.parseClientTeam(window.location.pathname)?.teamId;
+        const raw = window.localStorage.getItem('localConfig_v2');
+        const token = teamId ? exportCore.getTokenForTeam(raw, teamId) : null;
+        const apiBase = teamId ? exportCore.inferApiBase(raw, teamId) : null;
+        if (!token || !apiBase) throw new Error('missing token/config');
+        const params = { channel: target.channel, text: reply };
+        if (target.threadTs) params.thread_ts = target.threadTs;
+        const res = await ipcRenderer.invoke('slack-autocomplete:api-call', {
+          apiBase, teamId, token, method: 'chat.postMessage', params
+        });
+        if (!res || !res.json || res.json.ok !== true) {
+          throw new Error((res && res.json && res.json.error) || ('HTTP ' + (res && res.status)));
+        }
+        log('Notification reply sent to', target.channel);
+      } catch (err) {
+        console.warn('[SlackAutocompletePreload] Notification reply failed:', err);
+        ipcRenderer.invoke('slack-autocomplete:notify', {
+          id: `reply-failed-${Date.now()}`,
+          title: 'Reply not sent',
+          options: { body: 'Sending the notification reply failed: ' + (err?.message || err), urgency: 'critical' }
+        }).catch(() => {});
+      }
+    }
+
     ipcRenderer.on('slack-autocomplete:notification-event', (_event, payload) => {
       const instance = payload?.id ? notificationRegistry.get(payload.id) : null;
       if (!instance) return;
+      if (payload.type === 'reply') {
+        postNotificationReply(instance, payload.reply);
+        notificationRegistry.delete(payload.id);
+        return;
+      }
       emitNotificationEvent(instance, payload.type);
       if (payload.type === 'close') {
         notificationRegistry.delete(payload.id);
@@ -3055,7 +3127,37 @@ cat > preload.js <<'EOF'
   }
 
   function setupBadgeUpdater() {
+    const COUNTS_POLL_INTERVAL_MS = 30000;
+    const COUNTS_FRESH_MS = 90000;
+    let lastCountsAt = 0;
+
+    // Exact badge: poll the same client.counts API the official client uses.
+    // The title-parsing heuristic below stays as a fallback while counts are stale.
+    const pollCounts = async () => {
+      try {
+        const teamId = exportCore.parseClientTeam(window.location.pathname)?.teamId;
+        const raw = window.localStorage.getItem('localConfig_v2');
+        const token = teamId ? exportCore.getTokenForTeam(raw, teamId) : null;
+        const apiBase = teamId ? exportCore.inferApiBase(raw, teamId) : null;
+        if (!token || !apiBase || !ipcRenderer) return;
+        const res = await ipcRenderer.invoke('slack-autocomplete:api-call', {
+          apiBase, teamId, token, method: 'client.counts', params: {}
+        });
+        const badge = exportCore.computeBadgeFromCounts(res?.json);
+        if (badge === null) return; // API refused; keep title fallback active
+        lastCountsAt = Date.now();
+        ipcRenderer.invoke('slack-autocomplete:update-badge', badge).catch((err) => {
+          log('Failed to update badge', err);
+        });
+      } catch (err) {
+        log('client.counts poll failed', err);
+      }
+    };
+    setInterval(pollCounts, COUNTS_POLL_INTERVAL_MS);
+    setTimeout(pollCounts, 5000);
+
     const updateBadge = () => {
+      if (Date.now() - lastCountsAt < COUNTS_FRESH_MS) return;
       const title = document.title;
       let badge = '';
 
@@ -3482,6 +3584,28 @@ npx electron-packager . "$APP_NAME" \
   "${ICON_ARGS[@]}" > /dev/null
 
 APP_PATH="$APP_DIR/dist/${APP_NAME}-darwin-${EP_ARCH}/${APP_NAME}.app"
+
+# ---------------------------------------------------------------------------
+# Code signing: use a real identity from the local keychain when available.
+# The identity is auto-detected (or taken from SLACK_CODESIGN_IDENTITY) and is
+# never written to the repo. CI runners have no signing identity, so builds
+# there keep the ad-hoc signature applied by electron-packager/the workflow.
+# ---------------------------------------------------------------------------
+CODESIGN_IDENTITY="${SLACK_CODESIGN_IDENTITY:-}"
+if [[ -z "$CODESIGN_IDENTITY" ]] && command -v security >/dev/null 2>&1; then
+  CODESIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+  if [[ -z "$CODESIGN_IDENTITY" ]]; then
+    CODESIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development/ {print $2; exit}')"
+  fi
+fi
+if [[ -n "$CODESIGN_IDENTITY" ]]; then
+  echo "Code signing with identity: $CODESIGN_IDENTITY"
+  codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_PATH"
+  codesign --verify --verbose=2 "$APP_PATH"
+  echo "Signed. Notification Center identity will persist across rebuilds."
+else
+  echo "No code-signing identity found; keeping ad-hoc signature."
+fi
 
 echo
 echo "Done."

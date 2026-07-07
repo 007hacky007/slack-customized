@@ -222,6 +222,69 @@ async function fetchAllHistory(apiCall, opts, hooks) {
   return Array.from(map.values()).sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));
 }
 
+// --- Notification helpers (used by the preload's Notification bridge) ---
+
+// Deep-scans the options object Slack's web client passes to `new Notification()`
+// for a conversation id + message ts so an inline notification reply can be
+// posted via chat.postMessage. Explicitly named keys win over pattern matches.
+function extractNotificationTarget(options) {
+  const CHANNEL_RE = /\b([CDG][A-Z0-9]{7,})\b/;
+  const TS_RE = /\b(\d{10}\.\d{6})\b/;
+  let channel = null;
+  let ts = null;
+  let threadTs = null;
+  const seen = new Set();
+
+  function considerString(key, val) {
+    const k = String(key || '').toLowerCase();
+    const cm = CHANNEL_RE.exec(val);
+    if (cm) {
+      if (/channel|conversation|^ch$|^c$/.test(k)) channel = cm[1];
+      else if (!channel) channel = cm[1];
+    }
+    const tm = TS_RE.exec(val);
+    if (tm) {
+      if (/thread/.test(k)) threadTs = tm[1];
+      else if (/^ts$|timestamp|message/.test(k)) ts = ts || tm[1];
+      else if (!ts) ts = tm[1];
+    }
+  }
+
+  function visit(key, val, depth) {
+    if (val == null || depth > 6) return;
+    if (typeof val === 'string') { considerString(key, val); return; }
+    if (typeof val !== 'object' || seen.has(val)) return;
+    seen.add(val);
+    if (Array.isArray(val)) { for (const v of val) visit(key, v, depth + 1); return; }
+    for (const [k, v] of Object.entries(val)) visit(k, v, depth + 1);
+  }
+
+  visit('options', options, 0);
+  return channel ? { channel, ts, threadTs } : null;
+}
+
+// Turns a client.counts response into dock-badge text: mention total,
+// unread dot, or empty. Tolerant of shape drift in the undocumented API.
+function computeBadgeFromCounts(counts) {
+  if (!counts || counts.ok === false) return null;
+  let mentions = 0;
+  let unread = false;
+  const buckets = [counts.channels, counts.mpims, counts.ims];
+  for (const list of buckets) {
+    for (const item of (Array.isArray(list) ? list : [])) {
+      if (!item) continue;
+      mentions += (item.mention_count | 0) + (item.dm_count | 0);
+      if (item.has_unreads) unread = true;
+    }
+  }
+  if (counts.threads) {
+    mentions += counts.threads.mention_count | 0;
+    if (counts.threads.has_unreads) unread = true;
+  }
+  if (mentions > 0) return String(mentions);
+  return unread ? '•' : '';
+}
+
 function normalizeChannelTypes(types) {
   if (types === 'public_channel' || types === 'private_channel') return types;
   return 'public_channel,private_channel';
@@ -429,6 +492,7 @@ async function runExport(apiCall, ctx, hooks) {
 module.exports = {
   parseClientUrl, parseClientTeam, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
   normalizeChannelTypes, channelTypesLabel, fetchAllMemberChannels, buildChannelListDoc, formatChannelListText,
+  extractNotificationTarget, computeBadgeFromCounts,
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
   TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory, fetchThreadReplies,

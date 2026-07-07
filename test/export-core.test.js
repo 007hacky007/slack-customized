@@ -376,3 +376,42 @@ test('formatChannelListText emits one channel per line', () => {
   assert.equal(core.formatChannelListText([{ id: 'C1', name: 'general' }, { id: 'C2' }]), '#general\n#C2\n');
   assert.equal(core.formatChannelListText([]), '');
 });
+
+test('extractNotificationTarget finds channel and ts across option shapes', () => {
+  // explicit keys in data
+  assert.deepEqual(
+    core.extractNotificationTarget({ data: { channelId: 'C0123ABCD', ts: '1720000000.123456' } }),
+    { channel: 'C0123ABCD', ts: '1720000000.123456', threadTs: null }
+  );
+  // ids embedded in a tag string
+  assert.deepEqual(
+    core.extractNotificationTarget({ tag: 'msg-C0123ABCD-1720000000.123456' }),
+    { channel: 'C0123ABCD', ts: '1720000000.123456', threadTs: null }
+  );
+  // thread key wins for threadTs; group id supported
+  const t = core.extractNotificationTarget({ data: { conversation: 'G9999ZZZZ', thread_ts: '1720000000.000001' } });
+  assert.equal(t.channel, 'G9999ZZZZ');
+  assert.equal(t.threadTs, '1720000000.000001');
+  // nothing usable
+  assert.equal(core.extractNotificationTarget({ body: 'hello there' }), null);
+  assert.equal(core.extractNotificationTarget(null), null);
+  // cyclic objects do not loop forever
+  const cyc = { data: {} };
+  cyc.data.self = cyc;
+  cyc.data.channel = 'D0123ABCD';
+  assert.equal(core.extractNotificationTarget(cyc).channel, 'D0123ABCD');
+});
+
+test('computeBadgeFromCounts sums mentions, falls back to unread dot', () => {
+  assert.equal(core.computeBadgeFromCounts({
+    ok: true,
+    channels: [{ id: 'C1', mention_count: 2, has_unreads: true }, { id: 'C2', mention_count: 0 }],
+    mpims: [{ id: 'G1', mention_count: 1 }],
+    ims: [{ id: 'D1', dm_count: 3 }],
+    threads: { has_unreads: true, mention_count: 1 },
+  }), '7');
+  assert.equal(core.computeBadgeFromCounts({ ok: true, channels: [{ id: 'C1', has_unreads: true }] }), '•');
+  assert.equal(core.computeBadgeFromCounts({ ok: true, channels: [] }), '');
+  assert.equal(core.computeBadgeFromCounts({ ok: false, error: 'invalid_auth' }), null);
+  assert.equal(core.computeBadgeFromCounts(null), null);
+});

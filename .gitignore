@@ -1,1 +1,8 @@
 Slack.app/
+# never commit signing material
+*.p12
+*.cer
+*.pem
+*.key
+*.provisionprofile
+*.mobileprovision
