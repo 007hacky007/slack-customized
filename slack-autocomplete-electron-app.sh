@@ -132,8 +132,7 @@ const {
   Menu,
   dialog,
   net,
-  powerMonitor,
-  desktopCapturer
+  powerMonitor
 } = require('electron');
 const fs = require('fs');
 const path = require('path');
@@ -1467,28 +1466,37 @@ const SLACK_ALLOWED_PERMISSIONS = new Set([
   'fullscreen'
 ]);
 
+// Strict hostname check for permission grants: a URL merely containing the
+// substring "slack.com" (e.g. https://evil.com/slack.com) must not qualify.
+function isSlackHostUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    if (u.protocol !== 'https:') return false;
+    const h = u.hostname.toLowerCase().replace(/\.$/, '');
+    return h === 'slack.com' || h.endsWith('.slack.com');
+  } catch (err) {
+    return false;
+  }
+}
+
 function installPermissionHandlers(ses) {
   ses.setPermissionRequestHandler((wc, permission, callback) => {
-    const url = wc.getURL();
-    if (url.includes('slack.com') && SLACK_ALLOWED_PERMISSIONS.has(permission)) {
+    if (isSlackHostUrl(wc.getURL()) && SLACK_ALLOWED_PERMISSIONS.has(permission)) {
       return callback(true);
     }
     callback(false);
   });
 
   ses.setPermissionCheckHandler((_wc, permission, requestingOrigin) => {
-    return requestingOrigin.includes('slack.com') && SLACK_ALLOWED_PERMISSIONS.has(permission);
+    return isSlackHostUrl(requestingOrigin) && SLACK_ALLOWED_PERMISSIONS.has(permission);
   });
 
-  // Screen sharing for huddles: prefer the native macOS picker (same UX as the
-  // official app on Sonoma+); fall back to sharing the primary screen.
+  // Screen sharing for huddles via the native macOS picker (same UX as the
+  // official app). The handler callback only runs when the system picker is
+  // unavailable; never silently hand over a screen without user selection.
   try {
-    ses.setDisplayMediaRequestHandler((request, callback) => {
-      desktopCapturer.getSources({ types: ['screen'] }).then((sources) => {
-        // No 'loopback' audio here: system-audio loopback is Windows-only.
-        if (sources && sources.length) callback({ video: sources[0] });
-        else callback({});
-      }).catch(() => callback({}));
+    ses.setDisplayMediaRequestHandler((_request, callback) => {
+      callback({});
     }, { useSystemPicker: true });
   } catch (err) {
     console.warn('Failed to install display media handler', err);
