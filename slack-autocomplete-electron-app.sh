@@ -287,7 +287,7 @@ function windowTeam(win) {
 
 function focusOrCreateWindow(targetUrl = SLACK_URL) {
   const normalized = isSlackUrl(targetUrl) ? targetUrl : SLACK_URL;
-  const windows = BrowserWindow.getAllWindows().filter((win) => win && !win.isDestroyed());
+  const windows = BrowserWindow.getAllWindows().filter((win) => win && !win.isDestroyed() && !win.__sawPool);
 
   // Multi-workspace routing like the official app: a link for workspace X goes
   // to the window already showing X; otherwise the focused/first window
@@ -323,7 +323,7 @@ function focusOrCreateWindow(targetUrl = SLACK_URL) {
 }
 
 function showAllWindows() {
-  const windows = BrowserWindow.getAllWindows().filter((win) => win && !win.isDestroyed());
+  const windows = BrowserWindow.getAllWindows().filter((win) => win && !win.isDestroyed() && !win.__sawPool);
   if (windows.length === 0) {
     createWindow();
     return;
@@ -877,7 +877,7 @@ function resetWindowState() {
     console.warn('Failed to delete window state file:', err);
   }
 
-  const windows = BrowserWindow.getAllWindows().filter((win) => win && !win.isDestroyed());
+  const windows = BrowserWindow.getAllWindows().filter((win) => win && !win.isDestroyed() && !win.__sawPool);
   const primary = windows[0];
 
   windows.slice(1).forEach((win) => {
@@ -983,6 +983,48 @@ ipcMain.handle('slack-autocomplete:window-mode', (event) => {
   return WINDOW_MODES.get(event.sender.id) || { mode: 'normal' };
 });
 
+// --- Pop-out window pool -----------------------------------------------
+// The official app pre-creates hidden windows so "Open in new window" is
+// instant (visible in its CDP target list as pooled about:blank pages). We do
+// the same: one hidden window boots the client in the background; adopting it
+// only needs a client-side route change instead of a cold boot.
+let popoutPool = [];
+const POPOUT_READY_WAITERS = new Map(); // webContents.id -> show()
+
+function createPoolWindow() {
+  if (isQuitting) return null;
+  const win = createWindow(SLACK_URL, { show: false }, { mode: 'normal', pool: true });
+  win.__sawPool = true;
+  popoutPool.push(win);
+  win.on('closed', () => { popoutPool = popoutPool.filter((w) => w !== win); });
+  return win;
+}
+
+function adoptPopoutWindow(kind, targetUrl, threadUrl, size) {
+  const win = popoutPool.shift();
+  setTimeout(() => { try { createPoolWindow(); } catch (err) { /* ignore */ } }, 4000); // refill off the hot path
+  if (!win || win.isDestroyed()) return null;
+  win.__sawPool = false;
+  installHideOnClose(win);
+  WINDOW_MODES.set(win.webContents.id, kind === 'thread' ? { mode: 'thread', threadUrl } : { mode: 'channel' });
+  if (size) { try { win.setSize(size.width, size.height); win.center(); } catch (err) { /* ignore */ } }
+  try {
+    win.webContents.send('slack-autocomplete:adopt-popout', { mode: kind, url: targetUrl, threadUrl });
+  } catch (err) {
+    return null;
+  }
+  const show = () => { if (!win.isDestroyed() && !win.isVisible()) { win.show(); win.focus(); } };
+  POPOUT_READY_WAITERS.set(win.webContents.id, show);
+  setTimeout(show, 900); // fallback if the ready signal never arrives
+  return win;
+}
+
+ipcMain.handle('slack-autocomplete:popout-ready', (event) => {
+  const show = POPOUT_READY_WAITERS.get(event.sender.id);
+  if (show) { POPOUT_READY_WAITERS.delete(event.sender.id); show(); }
+  return { ok: true };
+});
+
 function isThreadUrl(targetUrl) {
   try {
     return isSlackUrl(targetUrl) && new URL(targetUrl).pathname.includes('/thread/');
@@ -1008,13 +1050,17 @@ function threadUrlToChannelUrl(threadUrl) {
 }
 
 function openThreadPopout(targetUrl) {
+  const adopted = adoptPopoutWindow('thread', String(targetUrl), String(targetUrl), { width: 520, height: 780 });
+  if (adopted) return adopted;
+  // No warm pool window: cold-boot fallback (channel URL first; a fresh
+  // window cannot cold-load a /thread/ deep link).
   const channelUrl = threadUrlToChannelUrl(targetUrl);
   return createWindow(channelUrl, { width: 520, height: 780 }, { mode: 'thread', threadUrl: String(targetUrl) });
 }
 
 function triggerDownload(url) {
   if (!url) return;
-  const windows = BrowserWindow.getAllWindows().filter((w) => w && !w.isDestroyed());
+  const windows = BrowserWindow.getAllWindows().filter((w) => w && !w.isDestroyed() && !w.__sawPool);
   const target = windows[0] || createWindow(SLACK_URL);
   try {
     target.webContents.downloadURL(url);
@@ -1247,8 +1293,8 @@ function installHideOnClose(win) {
     }
 
     // Let secondary windows actually close so window-state.json stays accurate.
-    const openWindows = BrowserWindow.getAllWindows().filter((w) => w && !w.isDestroyed());
-    const hasOtherWindows = openWindows.some((w) => w !== win);
+    const openWindows = BrowserWindow.getAllWindows().filter((w) => w && !w.isDestroyed() && !w.__sawPool);
+    const hasOtherWindows = openWindows.some((w) => w !== win && w.isVisible());
     if (hasOtherWindows) {
       return;
     }
@@ -1274,15 +1320,20 @@ function installHideOnClose(win) {
 
 function createWindow(initialUrl = SLACK_URL, windowOverrides, windowMode) {
   const win = new BrowserWindow(buildWindowOptions(windowOverrides));
-  if (windowMode && windowMode.mode) {
+  const isPool = Boolean(windowMode && windowMode.pool);
+  if (windowMode && windowMode.mode && windowMode.mode !== 'normal') {
     const wcId = win.webContents.id;
     WINDOW_MODES.set(wcId, windowMode);
     win.webContents.once('destroyed', () => WINDOW_MODES.delete(wcId));
   }
   applyWindowPolicies(win);
-  installHideOnClose(win);
+  if (!isPool) {
+    // Pool windows stay hidden and untracked: no hide-on-close, and they must
+    // not be persisted into window-state (they would reappear at next launch).
+    installHideOnClose(win);
+    attachWindowStateTracking(win, initialUrl);
+  }
   win.loadURL(initialUrl);
-  attachWindowStateTracking(win, initialUrl);
   return win;
 }
 
@@ -1301,7 +1352,9 @@ ipcMain.handle('slack-autocomplete:open-window', async (_event, targetUrl) => {
   } else if (isSlackAppNavigationUrl(targetUrl)) {
     // Channel "Open in new window": official shows just the channel view
     // (no rail/sidebar/top nav) - the preload learns the mode over IPC.
-    createWindow(targetUrl, undefined, { mode: 'channel' });
+    if (!adoptPopoutWindow('channel', targetUrl, null, null)) {
+      createWindow(targetUrl, undefined, { mode: 'channel' });
+    }
   } else {
     createWindow(targetUrl);
   }
@@ -1667,6 +1720,9 @@ app.whenReady().then(() => {
   const urlsToOpen = initialWindows.length ? initialWindows : [SLACK_URL];
   urlsToOpen.forEach((url) => createWindow(url));
 
+  // Warm the pop-out pool once the main window has had a head start.
+  setTimeout(() => { try { createPoolWindow(); } catch (err) { /* ignore */ } }, 6000);
+
   processPendingDeepLinks();
 
   app.on('activate', () => {
@@ -1745,6 +1801,39 @@ cat > preload.js <<'EOF'
       CHANNEL_POPOUT_MODE = true;
     }
   })();
+
+  // Warm-pool adoption: the main process hands this pre-booted hidden window
+  // a pop-out role. Client-side navigation (pushState + popstate) routes the
+  // already-running client instantly - no reload, no cold boot.
+  ipcRenderer?.on('slack-autocomplete:adopt-popout', (_event, payload) => {
+    if (!payload || THREAD_POPOUT_MODE || CHANNEL_POPOUT_MODE) return;
+    if (payload.mode === 'thread') {
+      THREAD_POPOUT_MODE = true;
+      THREAD_POPOUT_URL = typeof payload.threadUrl === 'string' ? payload.threadUrl : null;
+    } else if (payload.mode === 'channel') {
+      CHANNEL_POPOUT_MODE = true;
+    } else {
+      return;
+    }
+    let targetPath = null;
+    try { targetPath = new URL(payload.url).pathname; } catch (err) { targetPath = null; }
+    if (THREAD_POPOUT_MODE) applyThreadPopoutMode();
+    else applyChannelPopoutMode(targetPath);
+    // Navigate client-side: Slack's global link handler intercepts anchor
+    // clicks to client URLs and routes WITHOUT a reload (verified live -
+    // pushState+popstate changes the URL but never fires their router).
+    try {
+      const a = document.createElement('a');
+      a.href = payload.url;
+      a.style.display = 'none';
+      (document.body || document.documentElement).appendChild(a);
+      a.click();
+      a.remove();
+    } catch (err) {
+      try { window.location.href = payload.url; } catch (err2) { /* ignore */ }
+    }
+    setTimeout(() => { ipcRenderer.invoke('slack-autocomplete:popout-ready').catch(() => {}); }, 400);
+  });
   const IS_MAC_PRELOAD = (() => {
     try { return process.platform === 'darwin'; } catch (err) { return false; }
   })();
@@ -3905,6 +3994,8 @@ cat > preload.js <<'EOF'
       for (const sib of Array.from(parent.children)) {
         if (sib === node) continue;
         if (sib.tagName === 'SCRIPT' || sib.tagName === 'STYLE' || sib.tagName === 'LINK') continue;
+        // keep the theme gradient: it paints behind the transparent title strip
+        if (sib.classList && sib.classList.contains('p-theme_background')) continue;
         sib.setAttribute('data-saw-popout-hidden', '1');
       }
       node = parent;
@@ -3930,7 +4021,8 @@ cat > preload.js <<'EOF'
       `html.${rootClass} [data-qa="close_flexpane"],`,
       `html.${rootClass} [data-qa="flexpane_back"],`,
       `html.${rootClass} .p-flexpane_header button[aria-label="Close"],`,
-      `html.${rootClass} .p-flexpane_header button[aria-label="Back"] { display: none !important; }`
+      `html.${rootClass} .p-flexpane_header button[aria-label="Back"],`,
+      `html.${rootClass} #slack-autocomplete-thread-popout-wrapper { display: none !important; }`
     ].join('\n');
     (document.head || document.documentElement).appendChild(style);
   }
@@ -3976,37 +4068,51 @@ cat > preload.js <<'EOF'
       if (kind === 'thread' || isThreadTitle) t = 'Thread in ' + t;
       else if (isChannelTitle) t = '#' + t;
       titleEl.textContent = t;
-      try {
-        const bg = getComputedStyle(document.body).backgroundColor;
-        if (bg && bg !== 'rgba(0, 0, 0, 0)') bar.style.background = bg;
-      } catch (err) { /* keep fallback */ }
     };
     sync();
     setInterval(sync, 1000);
 
-    // Push the client content below the strip.
+    // The strip is transparent so Slack's theme gradient
+    // (.p-theme_background, spanning the whole window) shows through, like
+    // the official pop-out chrome. Only the workspace content moves down.
+    bar.style.background = 'transparent';
     const style = document.createElement('style');
-    style.textContent = '.p-client_container { position: fixed !important; top: var(--saw-titlebar-h) !important;'
-      + ' left: 0 !important; right: 0 !important; bottom: 0 !important; height: auto !important; }';
+    style.textContent = [
+      // Padding, NOT margin: a wrapper margin collapses through to the client
+      // container and drags the theme gradient down with it, leaving the
+      // strip over a white body.
+      'html.saw-channel-popout .p-ia4_client {',
+      '  padding-top: var(--saw-titlebar-h) !important;',
+      '  box-sizing: border-box !important;',
+      '}',
+      // The theme gradient div positions statically (auto top), so the
+      // padding would push it below the strip - pin it to the full viewport.
+      'html.saw-channel-popout .p-theme_background,',
+      'html.saw-thread-popout .p-theme_background {',
+      '  position: fixed !important; inset: 0 !important;',
+      '  width: 100vw !important; height: 100vh !important;',
+      '}',
+      'html.saw-channel-popout, html.saw-thread-popout { background: #1a1d21; }'
+    ].join('\n');
     (document.head || document.documentElement).appendChild(style);
   }
 
   function applyThreadPopoutMode() {
+    if (document.documentElement.classList.contains('saw-thread-popout')) return;
     document.documentElement.classList.add('saw-thread-popout');
     installPopoutChromeStyle('saw-thread-popout');
     installPopoutTitleBar('thread');
     installPopoutCover();
-    // The window boots on the channel route; once the client shell is up we
-    // navigate to the thread URL (full reload - the preload re-runs and this
-    // loop resumes on the thread route). The cover hides both boots.
+    // Cold-boot path: the window boots on the channel route and we navigate
+    // to the thread URL once the client shell is up. Adopted warm windows are
+    // already routed client-side, so the pane just appears.
     const startedAt = Date.now();
-    let lastAssign = 0;
-    const onThreadRoute = window.location.pathname.includes('/thread/');
+    let lastAssign = Date.now(); // grace period covers adopted windows' client-side navigation
     const tick = () => {
       const pane = document.querySelector(THREAD_PANE_SELECTORS);
       if (pane) {
         if (isolateThreadPane()) removePopoutCover();
-      } else if (!onThreadRoute && THREAD_POPOUT_URL
+      } else if (!window.location.pathname.includes('/thread/') && THREAD_POPOUT_URL
         && document.querySelector('.p-client_container')
         && Date.now() - lastAssign > 2500) {
         lastAssign = Date.now();
@@ -4029,7 +4135,8 @@ cat > preload.js <<'EOF'
   //   - a JS tick hides stray hash-classed gutter containers at the layout
   //     level (other boot variants put the sidebar wrapper there); React
   //     focus wrappers (display:contents) are left alone.
-  function applyChannelPopoutMode() {
+  function applyChannelPopoutMode(targetPath) {
+    if (document.documentElement.classList.contains('saw-channel-popout')) return;
     document.documentElement.classList.add('saw-channel-popout');
     installPopoutChromeStyle('saw-channel-popout');
     installPopoutTitleBar('channel');
@@ -4063,7 +4170,8 @@ cat > preload.js <<'EOF'
           el.style.setProperty('display', 'none', 'important');
         }
       }
-      if (document.querySelector('.p-view_header, [data-qa="message_pane"]')) removePopoutCover();
+      const routed = !targetPath || window.location.pathname === targetPath;
+      if (routed && document.querySelector('.p-view_header, [data-qa="message_pane"]')) removePopoutCover();
       if (Date.now() - startedAt > 20000) removePopoutCover();
     };
     tick();
