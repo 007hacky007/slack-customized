@@ -28,7 +28,7 @@ if [[ ! -f package.json ]]; then
   cat > package.json <<'EOF'
 {
   "name": "slack-autocomplete-electron",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Electron wrapper for Slack with autocomplete behavior override.",
   "main": "main.js",
   "scripts": {
@@ -833,6 +833,9 @@ function collectWindowUrls() {
   const seen = new Set();
 
   BrowserWindow.getAllWindows().forEach((win) => {
+    if (!win || win.isDestroyed() || win.__sawPool) {
+      return;
+    }
     const url = typeof win.__slackLastUrl === 'string' ? win.__slackLastUrl : SLACK_URL;
     const normalized = isSlackAppNavigationUrl(url) ? url : SLACK_URL;
     if (!seen.has(normalized)) {
@@ -990,6 +993,11 @@ ipcMain.handle('slack-autocomplete:window-mode', (event) => {
 // only needs a client-side route change instead of a cold boot.
 let popoutPool = [];
 const POPOUT_READY_WAITERS = new Map(); // webContents.id -> show()
+// 'browser-window-created' fires synchronously inside the BrowserWindow
+// constructor - before createPoolWindow() can stamp __sawPool on the new
+// window - so the global handler needs this module-level flag to know it is
+// looking at a pool window and must skip state tracking / hide-on-close.
+let constructingPoolWindow = false;
 
 function createPoolWindow() {
   if (isQuitting) return null;
@@ -1009,6 +1017,9 @@ function adoptPopoutWindow(kind, targetUrl, threadUrl, size) {
   if (!win || win.isDestroyed()) return null;
   win.__sawPool = false;
   installHideOnClose(win);
+  // Once adopted it is a real pop-out; track it like cold-booted pop-outs
+  // (createWindow attaches tracking for every non-pool window).
+  attachWindowStateTracking(win, targetUrl);
   WINDOW_MODES.set(win.webContents.id, kind === 'thread' ? { mode: 'thread', threadUrl } : { mode: 'channel' });
   if (size) { try { win.setSize(size.width, size.height); win.center(); } catch (err) { /* ignore */ } }
   try {
@@ -1322,8 +1333,10 @@ function installHideOnClose(win) {
 }
 
 function createWindow(initialUrl = SLACK_URL, windowOverrides, windowMode) {
-  const win = new BrowserWindow(buildWindowOptions(windowOverrides));
   const isPool = Boolean(windowMode && windowMode.pool);
+  constructingPoolWindow = isPool;
+  const win = new BrowserWindow(buildWindowOptions(windowOverrides));
+  constructingPoolWindow = false;
   if (windowMode && windowMode.mode && windowMode.mode !== 'normal') {
     const wcId = win.webContents.id;
     WINDOW_MODES.set(wcId, windowMode);
@@ -1735,6 +1748,12 @@ app.whenReady().then(() => {
 
 app.on('browser-window-created', (_event, window) => {
   applyWindowPolicies(window);
+  if (constructingPoolWindow) {
+    // Pool windows stay hidden and untracked; tracking one persists its URL
+    // into window-state.json and a ghost second window opens at next launch.
+    window.__sawPool = true;
+    return;
+  }
   attachWindowStateTracking(window);
   installHideOnClose(window);
 });
