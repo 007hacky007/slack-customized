@@ -2460,6 +2460,7 @@ cat > preload.js <<'EOF'
     const normalizedMenu = normalizeMenuElement(menuEl);
     if (!normalizedMenu) return;
     if (normalizedMenu.dataset.slackAutocompleteThreadMenuPatched === '1') return;
+    if (visibleMenuItemExists(THREAD_MENU_ITEM_QA)) return;
     if (Date.now() - pendingThreadContext.ts > CHANNEL_CONTEXT_TTL) {
       pendingThreadContext = null;
       return;
@@ -2484,17 +2485,46 @@ cat > preload.js <<'EOF'
     button.appendChild(label);
     wrapper.appendChild(button);
 
+    addMenuItemHighlight(wrapper, button);
+
     const threadUrl = pendingThreadContext.url;
     button.addEventListener('click', (clickEvent) => {
       clickEvent.preventDefault();
       clickEvent.stopPropagation();
-      openSlackWindow(threadUrl);
       pendingThreadContext = null;
-      requestAnimationFrame(closeContextMenus);
+      closeContextMenus(); // close first so the menu never lingers over the new window
+      openSlackWindow(threadUrl);
     });
 
     normalizedMenu.appendChild(wrapper);
     log('Inserted custom "Open thread in new window" action.');
+  }
+
+  // Slack drives menu-item highlighting with React state classes, not CSS
+  // :hover - injected items must toggle those classes themselves (and clear
+  // Slack's own highlight so two rows never glow at once).
+  function addMenuItemHighlight(wrapper, button) {
+    wrapper.addEventListener('mouseenter', () => {
+      const menu = wrapper.parentElement;
+      if (menu) {
+        menu.querySelectorAll('.c-menu_item__li--highlighted').forEach((el) => el.classList.remove('c-menu_item__li--highlighted'));
+        menu.querySelectorAll('.c-menu_item__button--highlighted').forEach((el) => el.classList.remove('c-menu_item__button--highlighted'));
+      }
+      wrapper.classList.add('c-menu_item__li--highlighted');
+      button.classList.add('c-menu_item__button--highlighted');
+    });
+    wrapper.addEventListener('mouseleave', () => {
+      wrapper.classList.remove('c-menu_item__li--highlighted');
+      button.classList.remove('c-menu_item__button--highlighted');
+    });
+  }
+
+  // Only one menu can be open at a time - if a visible copy of our item
+  // already exists anywhere, don't add another (nested menu containers used
+  // to each receive a copy, showing the item twice).
+  function visibleMenuItemExists(qa) {
+    return Array.from(document.querySelectorAll(`[data-qa="${qa}"]`))
+      .some((el) => el.getClientRects().length > 0);
   }
 
   function injectChannelMenuItem(menuEl) {
@@ -2503,6 +2533,7 @@ cat > preload.js <<'EOF'
     if (!normalizedMenu) return;
     if (!looksLikeChannelMenu(normalizedMenu)) return;
     if (normalizedMenu.dataset.slackAutocompleteMenuPatched === '1') return;
+    if (visibleMenuItemExists(CHANNEL_MENU_ITEM_QA)) return;
     if (Date.now() - pendingChannelContext.ts > CHANNEL_CONTEXT_TTL) {
       pendingChannelContext = null;
       return;
@@ -2548,12 +2579,17 @@ cat > preload.js <<'EOF'
     hr.setAttribute('data-qa', 'menu_separator__separator');
     separator.appendChild(hr);
 
+    addMenuItemHighlight(wrapper, button);
+
+    // Capture the URL at injection time: pendingChannelContext is shared
+    // mutable state that later menu scans may clear before the user clicks.
+    const channelUrl = pendingChannelContext.url;
     button.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      openSlackWindow(pendingChannelContext.url);
       pendingChannelContext = null;
-      requestAnimationFrame(closeContextMenus);
+      closeContextMenus(); // close first so the menu never lingers over the new window
+      openSlackWindow(channelUrl);
     });
 
     // Official placement: own section right before "Leave channel".
@@ -3788,39 +3824,84 @@ cat > preload.js <<'EOF'
   //      that otherwise pins it to ~440px.
   // This is layout-name-agnostic (only the pane must be found) and re-applied
   // because React re-renders drop our inline styles.
-  const THREAD_PANE_SELECTORS = [
+  const THREAD_PANE_CANDIDATES = [
     '[data-qa="threads_flexpane"]',
     '.p-thread_view',
     '[data-qa="thread_container"]',
     '.p-workspace__secondary_view',
     '.p-flexpane'
-  ].join(', ');
-  const CHANNEL_PANE_SELECTORS = '.p-view_contents--primary, .p-workspace__primary_view';
+  ];
+  const THREAD_PANE_SELECTORS = THREAD_PANE_CANDIDATES.join(', ');
   let threadPopoutPaneMatch = null;
 
+  function queryFirstPane(candidates) {
+    for (const sel of candidates) {
+      const el = document.querySelector(sel);
+      if (el) return el;
+    }
+    return null;
+  }
+
+  // Official pop-outs never flash the full client (the official app boots
+  // pooled hidden windows). We approximate: cover the window until the pane
+  // isolation succeeds, then reveal.
+  let popoutCover = null;
+  function installPopoutCover() {
+    const add = () => {
+      if (popoutCover || document.getElementById('slack-autocomplete-popout-cover')) return;
+      popoutCover = document.createElement('div');
+      popoutCover.id = 'slack-autocomplete-popout-cover';
+      popoutCover.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:#1a1d21;';
+      (document.body || document.documentElement).appendChild(popoutCover);
+    };
+    if (document.body) add();
+    else window.addEventListener('DOMContentLoaded', add, { once: true });
+  }
+  function removePopoutCover() {
+    const c = popoutCover || document.getElementById('slack-autocomplete-popout-cover');
+    popoutCover = null;
+    if (c) setTimeout(() => c.remove(), 250);
+  }
+
+  // Attribute + stylesheet based isolation, re-marked from scratch on every
+  // tick: React RECYCLES DOM nodes, so a node hidden with an inline style
+  // during boot can later be reused for visible content and stay hidden.
+  // Clearing and re-marking each pass self-heals that.
+  function ensureIsolationStyle() {
+    if (document.getElementById('slack-autocomplete-popout-isolation')) return;
+    const style = document.createElement('style');
+    style.id = 'slack-autocomplete-popout-isolation';
+    style.textContent = [
+      '[data-saw-popout-hidden] { display: none !important; }',
+      '[data-saw-popout-pane] {',
+      '  position: fixed !important; inset: 0 !important;',
+      '  width: 100vw !important; height: 100vh !important;',
+      '  max-width: none !important; background: #1a1d21 !important;',
+      '}'
+    ].join('\n');
+    (document.head || document.documentElement).appendChild(style);
+  }
+
   function isolatePaneElement(pane) {
+    ensureIsolationStyle();
+    document.querySelectorAll('[data-saw-popout-hidden]').forEach((el) => el.removeAttribute('data-saw-popout-hidden'));
+    document.querySelectorAll('[data-saw-popout-pane]').forEach((el) => { if (el !== pane) el.removeAttribute('data-saw-popout-pane'); });
     let node = pane;
     while (node && node.parentElement && node.parentElement !== document.body && node !== document.body) {
       const parent = node.parentElement;
       for (const sib of Array.from(parent.children)) {
         if (sib === node) continue;
         if (sib.tagName === 'SCRIPT' || sib.tagName === 'STYLE' || sib.tagName === 'LINK') continue;
-        sib.style.setProperty('display', 'none', 'important');
+        sib.setAttribute('data-saw-popout-hidden', '1');
       }
       node = parent;
     }
-    const bg = getComputedStyle(document.body).backgroundColor;
-    pane.style.setProperty('position', 'fixed', 'important');
-    pane.style.setProperty('inset', '0', 'important');
-    pane.style.setProperty('width', '100vw', 'important');
-    pane.style.setProperty('height', '100vh', 'important');
-    pane.style.setProperty('max-width', 'none', 'important');
-    pane.style.setProperty('background', (bg && bg !== 'rgba(0, 0, 0, 0)') ? bg : '#1a1d21', 'important');
+    pane.setAttribute('data-saw-popout-pane', '1');
     return true;
   }
 
   function isolateThreadPane() {
-    const pane = document.querySelector(THREAD_PANE_SELECTORS);
+    const pane = queryFirstPane(THREAD_PANE_CANDIDATES);
     if (!pane) return false;
     threadPopoutPaneMatch = pane.getAttribute('data-qa') || pane.className || pane.tagName;
     return isolatePaneElement(pane);
@@ -3832,8 +3913,11 @@ cat > preload.js <<'EOF'
   function installPopoutChromeStyle(rootClass, headerSelector) {
     const style = document.createElement('style');
     style.textContent = [
+      // In the pop-out's narrow layout the close control renders as a "<"
+      // chevron with aria-label="Close" (verified live) - hide every variant.
       `html.${rootClass} [data-qa="close_flexpane"],`,
       `html.${rootClass} [data-qa="flexpane_back"],`,
+      `html.${rootClass} .p-flexpane_header button[aria-label="Close"],`,
       `html.${rootClass} .p-flexpane_header button[aria-label="Back"] { display: none !important; }`,
       IS_MAC_PRELOAD ? `html.${rootClass} ${headerSelector} { padding-left: 72px !important; -webkit-app-region: drag; }` : '',
       IS_MAC_PRELOAD ? `html.${rootClass} ${headerSelector} button, html.${rootClass} ${headerSelector} a, html.${rootClass} ${headerSelector} [role="button"] { -webkit-app-region: no-drag; }` : ''
@@ -3844,34 +3928,66 @@ cat > preload.js <<'EOF'
   function applyThreadPopoutMode() {
     document.documentElement.classList.add('saw-thread-popout');
     installPopoutChromeStyle('saw-thread-popout', '.p-flexpane_header');
-    // The window boots on the channel route; open the thread client-side once
-    // the client is up (setting location to the thread URL opens the pane).
-    // Retry until the pane appears, then keep isolating (React re-renders drop
-    // our inline styles).
-    let openAttempts = 0;
+    installPopoutCover();
+    // The window boots on the channel route; once the client shell is up we
+    // navigate to the thread URL (full reload - the preload re-runs and this
+    // loop resumes on the thread route). The cover hides both boots.
+    const startedAt = Date.now();
+    let lastAssign = 0;
+    const onThreadRoute = window.location.pathname.includes('/thread/');
     const tick = () => {
       const pane = document.querySelector(THREAD_PANE_SELECTORS);
-      if (!pane && THREAD_POPOUT_URL && openAttempts < 12) {
-        openAttempts++;
+      if (pane) {
+        if (isolateThreadPane()) removePopoutCover();
+      } else if (!onThreadRoute && THREAD_POPOUT_URL
+        && document.querySelector('.p-client_container')
+        && Date.now() - lastAssign > 2500) {
+        lastAssign = Date.now();
         try { window.location.assign(THREAD_POPOUT_URL); } catch (err) { /* ignore */ }
-        return;
       }
-      if (pane) isolateThreadPane();
+      if (Date.now() - startedAt > 25000) removePopoutCover(); // never brick the window
     };
-    // Give the client a moment to boot before the first open attempt.
-    [1500, 2200, 3000, 4000, 5000].forEach((ms) => setTimeout(tick, ms));
-    setInterval(tick, 1200);
+    tick();
+    setInterval(tick, 300);
   }
 
+  // Channel pop-out: rather than isolate a "content pane" (Slack's channel
+  // content class varies across view states - primary / split / secondary -
+  // so anchoring on it is unreliable), remove the two chrome elements we
+  // always want gone and collapse their grid tracks. This is view-state
+  // independent: the tab rail and channel sidebar live at stable positions in
+  // the workspace grid (verified live: wrapper grid = "[rail] [workspace]").
   function applyChannelPopoutMode() {
     document.documentElement.classList.add('saw-channel-popout');
     installPopoutChromeStyle('saw-channel-popout', '.p-view_header, [data-qa="channel_header"]');
+    const style = document.createElement('style');
+    style.id = 'slack-autocomplete-channel-popout';
+    style.textContent = [
+      'html.saw-channel-popout .p-tab_rail,',
+      'html.saw-channel-popout [data-qa="tab_rail_desktop"],',
+      'html.saw-channel-popout .p-channel_sidebar,',
+      'html.saw-channel-popout .p-view_contents--sidebar,',
+      // The sidebar sits inside a hash-classed wrapper that owns the grid
+      // column - hide the wrapper too or an empty gutter remains.
+      'html.saw-channel-popout .p-client_workspace__layout > :has(.p-view_contents--sidebar),',
+      'html.saw-channel-popout .p-client_workspace__layout > :has(.p-channel_sidebar),',
+      'html.saw-channel-popout [data-qa="channel_sidebar"],',
+      // The official channel window has no global top nav (search bar); the
+      // channel header sits at the very top and holds the traffic lights.
+      'html.saw-channel-popout .p-ia4_top_nav { display: none !important; }',
+      // Collapse the rail column so the workspace fills the window.
+      'html.saw-channel-popout .p-client_workspace_wrapper { grid-template-columns: 0 1fr !important; }'
+    ].join('\n');
+    (document.head || document.documentElement).appendChild(style);
+    installPopoutCover();
+    // Reveal once the client shell (top nav or a view header) has rendered.
+    const startedAt = Date.now();
     const tick = () => {
-      const pane = document.querySelector(CHANNEL_PANE_SELECTORS);
-      if (pane) isolatePaneElement(pane);
+      if (document.querySelector('.p-view_header, .p-ia4_top_nav, [data-qa="message_pane"]')) removePopoutCover();
+      if (Date.now() - startedAt > 20000) removePopoutCover();
     };
-    [1500, 2500, 4000].forEach((ms) => setTimeout(tick, ms));
-    setInterval(tick, 1200);
+    tick();
+    setInterval(tick, 300);
   }
 
   // hiddenInset title bar in regular windows: pad Slack's top nav so its
