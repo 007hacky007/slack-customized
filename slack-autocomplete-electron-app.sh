@@ -463,6 +463,54 @@ async function clearAppCache(targetWindow, options = {}) {
   }
 }
 
+// --- Persisted app settings (currently just the downloads location) ---
+let appSettings = { downloadsDir: null };
+
+function appSettingsPath() {
+  return path.join(app.getPath('userData'), 'app-settings.json');
+}
+
+function loadAppSettings() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(appSettingsPath(), 'utf8'));
+    if (parsed && typeof parsed === 'object') appSettings = Object.assign(appSettings, parsed);
+  } catch (err) { /* first run */ }
+}
+
+function saveAppSettings() {
+  try {
+    fs.writeFileSync(appSettingsPath(), JSON.stringify(appSettings, null, 2));
+  } catch (err) {
+    console.warn('Failed to save app settings', err);
+  }
+}
+
+function effectiveDownloadsDir() {
+  return appSettings.downloadsDir || app.getPath('downloads');
+}
+
+function uniqueSavePath(dir, filename) {
+  const ext = path.extname(filename);
+  const base = path.basename(filename, ext);
+  let candidate = path.join(dir, filename);
+  for (let i = 1; fs.existsSync(candidate) && i < 1000; i++) {
+    candidate = path.join(dir, base + ' (' + i + ')' + ext);
+  }
+  return candidate;
+}
+
+async function chooseDownloadsLocation() {
+  const res = await dialog.showOpenDialog({
+    properties: ['openDirectory', 'createDirectory'],
+    defaultPath: effectiveDownloadsDir()
+  });
+  if (!res.canceled && res.filePaths && res.filePaths[0]) {
+    appSettings.downloadsDir = res.filePaths[0];
+    saveAppSettings();
+    installApplicationMenu();
+  }
+}
+
 // Signed-in workspaces, reported by the renderer from Slack's own local
 // config. Drives the Workspace menu (Cmd+1..9 switching, like the official app).
 let knownTeams = [];
@@ -545,6 +593,23 @@ function installApplicationMenu() {
             const w = focusedWindow || BrowserWindow.getFocusedWindow();
             if (w) w.webContents.send('slack-autocomplete:toggle-downloads');
           }
+        },
+        {
+          label: 'Downloads Location',
+          submenu: [
+            { label: appSettings.downloadsDir || 'System Downloads Folder', enabled: false },
+            { type: 'separator' },
+            { label: 'Choose...', click: () => { chooseDownloadsLocation(); } },
+            {
+              label: 'Use System Downloads Folder',
+              enabled: Boolean(appSettings.downloadsDir),
+              click: () => {
+                appSettings.downloadsDir = null;
+                saveAppSettings();
+                installApplicationMenu();
+              }
+            }
+          ]
         },
         { type: 'separator' },
         {
@@ -944,6 +1009,15 @@ function broadcastDownloadEvent(entry) {
 let downloadCounter = 0;
 function installDownloadTracking(ses) {
   ses.on('will-download', (_event, item) => {
+    // Honor the configured downloads location (File > Downloads Location)
+    // and avoid clobbering existing files, like the official app.
+    try {
+      const dir = effectiveDownloadsDir();
+      fs.mkdirSync(dir, { recursive: true });
+      item.setSavePath(uniqueSavePath(dir, item.getFilename()));
+    } catch (err) {
+      console.warn('Failed to set download save path', err);
+    }
     const id = 'dl' + (++downloadCounter);
     const entry = {
       id,
@@ -1044,13 +1118,10 @@ function applyWindowPolicies(win) {
     }
 
     if (isSlackUrl(url)) {
-      // Client routes go to the workspace's window. Everything else on
-      // slack.com (file viewers, canvases, auth popups) gets a real child
-      // window, matching the official app instead of hijacking the client.
-      if (isSlackAppNavigationUrl(url)) {
-        focusOrCreateWindow(url);
-        return { action: 'deny' };
-      }
+      // Official-app behavior: when the Slack client asks for a new window
+      // (conversation pop-outs, huddle windows, file viewers, auth popups),
+      // it gets a real one. Deep links and workspace switching still reuse
+      // windows via focusOrCreateWindow elsewhere.
       return {
         action: 'allow',
         overrideBrowserWindowOptions: buildWindowOptions()
@@ -1062,9 +1133,18 @@ function applyWindowPolicies(win) {
     return { action: 'deny' };
   });
 
-  // Child windows opened with action:'allow' need the same policies.
-  win.webContents.on('did-create-window', (child) => {
-    try { applyWindowPolicies(child); } catch (err) { console.warn('Failed to apply policies to child window', err); }
+  // Child windows opened with action:'allow' need the same policies, plus
+  // URL tracking so team-aware routing can find them.
+  win.webContents.on('did-create-window', (child, details) => {
+    try {
+      applyWindowPolicies(child);
+      child.__slackLastUrl = (details && details.url) || '';
+      const trackChildUrl = (_e, u) => { if (typeof u === 'string') child.__slackLastUrl = u; };
+      child.webContents.on('did-navigate', trackChildUrl);
+      child.webContents.on('did-navigate-in-page', trackChildUrl);
+    } catch (err) {
+      console.warn('Failed to apply policies to child window', err);
+    }
   });
 
   win.webContents.on('will-navigate', (event, url) => {
@@ -1506,6 +1586,7 @@ function installPermissionHandlers(ses) {
 app.whenReady().then(() => {
   // Global default UA (covers auth popups etc.).
   session.defaultSession.setUserAgent(CHROME_UA);
+  loadAppSettings();
   installPermissionHandlers(session.defaultSession);
   installDownloadTracking(session.defaultSession);
   registerProtocolHandler();
