@@ -2101,63 +2101,12 @@ cat > preload.js <<'EOF'
     fallbackWindowOpen(url);
   }
 
-  function openExternalLink(url) {
-    if (!url) return;
-    if (ipcRenderer?.invoke) {
-      ipcRenderer.invoke('slack-autocomplete:open-external', url).catch((err) => {
-        log('IPC open-external failed, falling back to window.open', err);
-        fallbackWindowOpen(url);
-      });
-      return;
-    }
-
-    fallbackWindowOpen(url);
-  }
-
-  function isOpenableExternalUrl(targetUrl) {
-    try {
-      const parsed = new URL(targetUrl, window.location.href);
-      return ['http:', 'https:', 'mailto:', 'tel:'].includes(parsed.protocol);
-    } catch (err) {
-      return false;
-    }
-  }
-
-  function isSlackHostUrl(targetUrl) {
-    try {
-      const parsed = new URL(targetUrl, window.location.href);
-      return parsed.hostname === 'slack.com' || parsed.hostname.endsWith('.slack.com');
-    } catch (err) {
-      return false;
-    }
-  }
-
-  function setupExternalLinkInterception() {
-    const handlePointerOpen = (event) => {
-      if (!event.isTrusted) return;
-      if (event.defaultPrevented) return;
-      if (event.type === 'click' && event.button !== 0) return;
-      if (!(event.target instanceof Element)) return;
-
-      const anchor = event.target.closest('a[href]');
-      if (!anchor) return;
-
-      const rawHref = anchor.getAttribute('href');
-      if (!rawHref || rawHref.startsWith('#')) return;
-
-      const targetUrl = anchor.href;
-      if (!isOpenableExternalUrl(targetUrl)) return;
-      if (isLikelyMainClientRoute(targetUrl)) return;
-      if (isSlackHostUrl(targetUrl)) return;
-
-      event.preventDefault();
-      event.stopPropagation();
-      openExternalLink(targetUrl);
-    };
-
-    document.addEventListener('click', handlePointerOpen, true);
-    document.addEventListener('auxclick', handlePointerOpen, true);
-  }
+  // NOTE: There used to be a capture-phase click interceptor here that sent
+  // any external anchor straight to the system browser. It preempted Slack's
+  // own click handling, so e.g. Giphy images opened in the browser instead of
+  // Slack's in-app lightbox. The official app does no renderer-level click
+  // interception - external routing happens in the main process via the
+  // window-open handler and will-navigate, which this app also has.
 
   ipcRenderer?.on('slack-autocomplete:open-url', (_event, targetUrl) => {
     if (typeof targetUrl !== 'string') return;
@@ -3599,7 +3548,6 @@ cat > preload.js <<'EOF'
     setupNativeContextMenu();
     setupAutocompleteObservers();
     setupChannelContextMenuSupport();
-    setupExternalLinkInterception();
     setupAttachmentEscape();
     setupThreadWatcher();
     setupBadgeUpdater();
