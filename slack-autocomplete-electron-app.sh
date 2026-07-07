@@ -559,16 +559,14 @@ function installApplicationMenu() {
         { role: 'togglefullscreen' }
       ]
     },
-    {
-      label: 'Window',
-      submenu: [
-        { role: 'minimize' },
-        { role: 'zoom' },
-        ...(IS_MAC
-          ? [{ type: 'separator' }, { role: 'front' }, { role: 'window' }]
-          : [{ role: 'close' }])
-      ]
-    },
+    // The standard window menu role is required for macOS to append its
+    // system items (Move & Resize / split-screen tiling on Sequoia).
+    ...(IS_MAC
+      ? [{ role: 'windowMenu' }]
+      : [{
+          label: 'Window',
+          submenu: [{ role: 'minimize' }, { role: 'zoom' }, { role: 'close' }]
+        }]),
     {
       role: 'help',
       submenu: [
