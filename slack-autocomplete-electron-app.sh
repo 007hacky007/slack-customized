@@ -1700,6 +1700,7 @@ cat > preload.js <<'EOF'
   const THREAD_BUTTON_WRAPPER_ID = 'slack-autocomplete-thread-popout-wrapper';
   const CHANNEL_MENU_ITEM_QA = 'slack_autocomplete_open_window';
   const CHANNEL_MENU_SEPARATOR_QA = 'slack_autocomplete_open_window_separator';
+  const THREAD_MENU_ITEM_QA = 'slack_autocomplete_open_thread_window';
   const ATTACHMENT_EXIT_ID = 'slack-autocomplete-attachment-exit';
   const LAST_MAIN_URL_KEY = 'slackAutocompleteLastMainUrl';
 
@@ -1739,6 +1740,13 @@ cat > preload.js <<'EOF'
       },
       installNotifications() {
         installNativeNotificationBridge();
+      },
+      threadPopoutStatus() {
+        return {
+          mode: THREAD_POPOUT_MODE,
+          paneFound: Boolean(document.querySelector(THREAD_PANE_SELECTORS)),
+          paneMatch: threadPopoutPaneMatch
+        };
       },
       enableDebug() {
         try {
@@ -2340,11 +2348,12 @@ cat > preload.js <<'EOF'
     if (menuScanHandle) return;
     menuScanHandle = setTimeout(() => {
       menuScanHandle = null;
-      if (!pendingChannelContext) return;
+      if (!pendingChannelContext && !pendingThreadContext) return;
       document
         .querySelectorAll('[data-qa="menu_items"], .c-menu__items, [role="menu"]')
         .forEach((menu) => {
-        injectChannelMenuItem(menu);
+          injectChannelMenuItem(menu);
+          injectThreadMenuItem(menu);
         });
     }, 40);
   }
@@ -2363,6 +2372,65 @@ cat > preload.js <<'EOF'
     };
 
     requestMenuScan();
+  }
+
+  // Right-click inside the thread pane: remember the thread so the item can
+  // be injected into whatever menu Slack renders for that click (the official
+  // client puts its "Open in new window" inside its own menu the same way).
+  let pendingThreadContext = null;
+
+  function captureThreadContext(event) {
+    pendingThreadContext = null;
+    if (THREAD_POPOUT_MODE) return; // no pop-out from inside a pop-out
+    if (!(event.target instanceof Element)) return;
+    if (!event.target.closest(THREAD_PANE_SELECTORS)) return;
+    let url = null;
+    try { url = getCurrentThreadUrl(false); } catch (err) { url = null; }
+    if (!url || !url.includes('/thread/')) return;
+    pendingThreadContext = { url, ts: Date.now() };
+    requestMenuScan();
+  }
+
+  function injectThreadMenuItem(menuEl) {
+    if (!pendingThreadContext) return;
+    const normalizedMenu = normalizeMenuElement(menuEl);
+    if (!normalizedMenu) return;
+    if (normalizedMenu.dataset.slackAutocompleteThreadMenuPatched === '1') return;
+    if (Date.now() - pendingThreadContext.ts > CHANNEL_CONTEXT_TTL) {
+      pendingThreadContext = null;
+      return;
+    }
+
+    normalizedMenu.dataset.slackAutocompleteThreadMenuPatched = '1';
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'c-menu_item__li';
+    wrapper.dataset.qa = THREAD_MENU_ITEM_QA;
+
+    const button = document.createElement('button');
+    button.className = 'c-button-unstyled c-menu_item__button';
+    button.type = 'button';
+    button.setAttribute('role', 'menuitem');
+    button.tabIndex = -1;
+
+    const label = document.createElement('div');
+    label.className = 'c-menu_item__label';
+    label.textContent = 'Open thread in new window';
+
+    button.appendChild(label);
+    wrapper.appendChild(button);
+
+    const threadUrl = pendingThreadContext.url;
+    button.addEventListener('click', (clickEvent) => {
+      clickEvent.preventDefault();
+      clickEvent.stopPropagation();
+      openSlackWindow(threadUrl);
+      pendingThreadContext = null;
+      requestAnimationFrame(closeContextMenus);
+    });
+
+    normalizedMenu.appendChild(wrapper);
+    log('Inserted custom "Open thread in new window" action.');
   }
 
   function injectChannelMenuItem(menuEl) {
@@ -2430,7 +2498,7 @@ cat > preload.js <<'EOF'
   }
 
   function handleMenuMutations(mutations) {
-    if (!pendingChannelContext) return;
+    if (!pendingChannelContext && !pendingThreadContext) return;
 
     for (const mutation of mutations) {
       mutation.addedNodes.forEach((node) => {
@@ -2439,12 +2507,14 @@ cat > preload.js <<'EOF'
         const menuEl = resolveMenuContainer(node);
         if (menuEl) {
           injectChannelMenuItem(menuEl);
+          injectThreadMenuItem(menuEl);
         }
 
         node
           .querySelectorAll?.('[data-qa="menu_items"], .c-menu__items, [role="menu"]')
           .forEach((menu) => {
             injectChannelMenuItem(menu);
+            injectThreadMenuItem(menu);
           });
       });
     }
@@ -2454,6 +2524,7 @@ cat > preload.js <<'EOF'
 
   function setupChannelContextMenuSupport() {
     document.addEventListener('contextmenu', captureChannelContext, true);
+    document.addEventListener('contextmenu', captureThreadContext, true);
 
     if (menuObserver) {
       menuObserver.disconnect();
@@ -3615,21 +3686,46 @@ cat > preload.js <<'EOF'
     exposeDebugHelpers();
   }
 
-  // Thread-only pop-out: hide everything except the thread pane so the window
-  // shows just the thread, like the official app's thread windows.
+  // Thread-only pop-out: isolate the thread pane by hiding its siblings all
+  // the way up the tree. Unlike a class-name CSS approach this survives
+  // Slack renaming classes - we only need to FIND the pane, not know the
+  // layout around it. Overlays mounted directly on <body> (menus, modals)
+  // are left alone so Slack dialogs still work.
+  const THREAD_PANE_SELECTORS = [
+    '[data-qa="threads_flexpane"]',
+    '.p-thread_view',
+    '[data-qa="thread_container"]',
+    '.p-workspace__secondary_view',
+    '.p-flexpane'
+  ].join(', ');
+  let threadPopoutPaneMatch = null;
+
+  function isolateThreadPane() {
+    const pane = document.querySelector(THREAD_PANE_SELECTORS);
+    if (!pane) return false;
+    threadPopoutPaneMatch = pane.getAttribute('data-qa') || pane.className || pane.tagName;
+    let node = pane;
+    while (node && node.parentElement && node.parentElement !== document.body && node !== document.body) {
+      const parent = node.parentElement;
+      for (const sib of Array.from(parent.children)) {
+        if (sib === node) continue;
+        if (sib.tagName === 'SCRIPT' || sib.tagName === 'STYLE' || sib.tagName === 'LINK') continue;
+        sib.style.setProperty('display', 'none', 'important');
+      }
+      node.style.setProperty('width', '100%', 'important');
+      node.style.setProperty('max-width', 'none', 'important');
+      node.style.setProperty('height', '100%', 'important');
+      node.style.setProperty('flex', '1 1 auto', 'important');
+      node = parent;
+    }
+    return true;
+  }
+
   function applyThreadPopoutMode() {
-    if (document.getElementById('slack-autocomplete-thread-popout-style')) return;
-    const style = document.createElement('style');
-    style.id = 'slack-autocomplete-thread-popout-style';
-    style.textContent = [
-      '.p-tab_rail, .p-workspace__sidebar, .p-top_nav, .p-control_strip,',
-      '.p-workspace__banner, .p-workspace__primary_view { display: none !important; }',
-      '.p-workspace__secondary_view, .p-flexpane {',
-      '  position: fixed !important; inset: 0 !important;',
-      '  width: 100vw !important; max-width: 100vw !important; height: 100vh !important;',
-      '}'
-    ].join('\n');
-    (document.head || document.documentElement).appendChild(style);
+    // Re-apply forever: Slack's React re-renders recreate nodes without our
+    // inline styles, so a one-shot pass would slowly un-hide the client.
+    isolateThreadPane();
+    setInterval(isolateThreadPane, 1000);
   }
 
   // ===================== Downloads panel (official-style pane) =====================
