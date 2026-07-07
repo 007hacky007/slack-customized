@@ -994,6 +994,9 @@ const POPOUT_READY_WAITERS = new Map(); // webContents.id -> show()
 function createPoolWindow() {
   if (isQuitting) return null;
   const win = createWindow(SLACK_URL, { show: false }, { mode: 'normal', pool: true });
+  // Chromium throttles timers in hidden windows, which would slow the pool
+  // window's background boot - the whole point of having it.
+  try { win.webContents.setBackgroundThrottling(false); } catch (err) { /* ignore */ }
   win.__sawPool = true;
   popoutPool.push(win);
   win.on('closed', () => { popoutPool = popoutPool.filter((w) => w !== win); });
