@@ -3758,81 +3758,86 @@ cat > preload.js <<'EOF'
   }
 
   function setupBadgeUpdater() {
+    // client.counts is the authoritative badge source: modern Slack titles
+    // carry no unread markers at all (verified live: no '*'/'!' prefix, no
+    // '(N)'), so the old title heuristic can never fire. Muted conversations
+    // (users.prefs.get muted_channels) are excluded from the unread dot like
+    // the official badge. Reads are picked up quickly via repolls triggered
+    // by title changes (channel switches) and window focus.
     const COUNTS_POLL_INTERVAL_MS = 30000;
-    const COUNTS_FRESH_MS = 90000;
-    const COUNTS_REFRESH_DEBOUNCE_MS = 1000;
-    let lastCountsAt = 0;
+    const MUTED_POLL_INTERVAL_MS = 600000;
     let countsMentions = 0;
-    let refreshHandle = null;
+    let countsUnread = false;
+    let haveCounts = false;
+    let mutedIds = new Set();
+    let refreshHandles = [];
 
-    // The window title is the instant source of truth for WHETHER anything is
-    // unread (it clears the moment you read); client.counts only refines the
-    // mention number, since its has_unreads also covers muted channels.
-    const parseTitle = () => {
-      const title = document.title;
-      const suffixMatch = title.match(/-\s*(\d+)\s*new\s*items?\s*-\s*Slack\s*$/i);
-      const prefixMatch = title.match(/^\((\d+)\)/);
-      return {
-        count: suffixMatch ? suffixMatch[1] : (prefixMatch ? prefixMatch[1] : ''),
-        dot: !suffixMatch && !prefixMatch && (title.startsWith('!') || title.startsWith('*')),
-      };
+    const apiCall = async (method) => {
+      const teamId = exportCore.parseClientTeam(window.location.pathname)?.teamId;
+      const raw = window.localStorage.getItem('localConfig_v2');
+      const token = teamId ? exportCore.getTokenForTeam(raw, teamId) : null;
+      const apiBase = teamId ? exportCore.inferApiBase(raw, teamId) : null;
+      if (!token || !apiBase || !ipcRenderer) return null;
+      return ipcRenderer.invoke('slack-autocomplete:api-call', {
+        apiBase, teamId, token, method, params: {}
+      });
     };
 
     const applyBadge = () => {
-      const t = parseTitle();
-      let badge = '';
-      if (t.count || t.dot) {
-        const countsFresh = Date.now() - lastCountsAt < COUNTS_FRESH_MS;
-        if (countsFresh && countsMentions > 0) badge = String(countsMentions);
-        else badge = t.count || '•';
-      }
-      if (ipcRenderer) {
-        ipcRenderer.invoke('slack-autocomplete:update-badge', badge).catch((err) => {
-          log('Failed to update badge', err);
-        });
-      }
+      if (!haveCounts || !ipcRenderer) return;
+      const badge = countsMentions > 0 ? String(countsMentions) : (countsUnread ? '•' : '');
+      ipcRenderer.invoke('slack-autocomplete:update-badge', badge).catch((err) => {
+        log('Failed to update badge', err);
+      });
     };
 
     const pollCounts = async () => {
       try {
-        const teamId = exportCore.parseClientTeam(window.location.pathname)?.teamId;
-        const raw = window.localStorage.getItem('localConfig_v2');
-        const token = teamId ? exportCore.getTokenForTeam(raw, teamId) : null;
-        const apiBase = teamId ? exportCore.inferApiBase(raw, teamId) : null;
-        if (!token || !apiBase || !ipcRenderer) return;
-        const res = await ipcRenderer.invoke('slack-autocomplete:api-call', {
-          apiBase, teamId, token, method: 'client.counts', params: {}
-        });
-        const summary = exportCore.summarizeCounts(res?.json);
-        if (!summary) return; // API refused; title heuristic stays in charge
-        lastCountsAt = Date.now();
+        const res = await apiCall('client.counts');
+        const summary = exportCore.summarizeCounts(res?.json, mutedIds);
+        if (!summary) return;
+        haveCounts = true;
         countsMentions = summary.mentions;
+        countsUnread = summary.hasUnreads;
         applyBadge();
       } catch (err) {
         log('client.counts poll failed', err);
       }
     };
-    setInterval(pollCounts, COUNTS_POLL_INTERVAL_MS);
-    setTimeout(pollCounts, 5000);
 
-    const onTitleChange = () => {
-      applyBadge(); // instant: clears the badge as soon as everything is read
-      if (refreshHandle) clearTimeout(refreshHandle);
-      refreshHandle = setTimeout(pollCounts, COUNTS_REFRESH_DEBOUNCE_MS);
+    const pollMuted = async () => {
+      try {
+        const res = await apiCall('users.prefs.get');
+        if (res?.json?.ok) mutedIds = exportCore.parseMutedChannels(res.json);
+      } catch (err) {
+        log('users.prefs.get poll failed', err);
+      }
+    };
+
+    setInterval(pollCounts, COUNTS_POLL_INTERVAL_MS);
+    setInterval(pollMuted, MUTED_POLL_INTERVAL_MS);
+    setTimeout(async () => { await pollMuted(); pollCounts(); }, 5000);
+
+    // Reads usually coincide with a channel switch (title change) or the
+    // window regaining focus; repoll shortly after so the dot clears fast.
+    const scheduleRepolls = () => {
+      refreshHandles.forEach(clearTimeout);
+      refreshHandles = [setTimeout(pollCounts, 1000), setTimeout(pollCounts, 4000)];
     };
 
     const titleEl = document.querySelector('title');
     if (titleEl) {
-      const observer = new MutationObserver(onTitleChange);
+      const observer = new MutationObserver(scheduleRepolls);
       observer.observe(titleEl, {
         childList: true,
         characterData: true,
         subtree: true
       });
     }
-
-    // Initial check
-    applyBadge();
+    window.addEventListener('focus', scheduleRepolls);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') scheduleRepolls();
+    });
   }
 
   function installIdleDetector() {

@@ -265,8 +265,11 @@ function extractNotificationTarget(options) {
 
 // Summarizes a client.counts response. Tolerant of shape drift in the
 // undocumented API. Returns null when the response is unusable.
-function summarizeCounts(counts) {
+// mutedIds (optional Set): muted conversations are excluded from the unread
+// dot (like the official badge) but their mentions still count.
+function summarizeCounts(counts, mutedIds) {
   if (!counts || counts.ok === false) return null;
+  const muted = mutedIds instanceof Set ? mutedIds : new Set();
   let mentions = 0;
   let unread = false;
   const buckets = [counts.channels, counts.mpims, counts.ims];
@@ -274,7 +277,7 @@ function summarizeCounts(counts) {
     for (const item of (Array.isArray(list) ? list : [])) {
       if (!item) continue;
       mentions += (item.mention_count | 0) + (item.dm_count | 0);
-      if (item.has_unreads) unread = true;
+      if (item.has_unreads && !muted.has(item.id)) unread = true;
     }
   }
   if (counts.threads) {
@@ -282,6 +285,18 @@ function summarizeCounts(counts) {
     if (counts.threads.has_unreads) unread = true;
   }
   return { mentions, hasUnreads: unread };
+}
+
+// Extracts the muted conversation ids from a users.prefs.get response
+// (prefs.muted_channels is a comma-separated id list).
+function parseMutedChannels(prefsResponse) {
+  const raw = prefsResponse && prefsResponse.prefs && prefsResponse.prefs.muted_channels;
+  const out = new Set();
+  for (const id of String(raw || '').split(',')) {
+    const t = id.trim();
+    if (t) out.add(t);
+  }
+  return out;
 }
 
 function computeBadgeFromCounts(counts) {
@@ -498,7 +513,7 @@ async function runExport(apiCall, ctx, hooks) {
 module.exports = {
   parseClientUrl, parseClientTeam, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
   normalizeChannelTypes, channelTypesLabel, fetchAllMemberChannels, buildChannelListDoc, formatChannelListText,
-  extractNotificationTarget, summarizeCounts, computeBadgeFromCounts,
+  extractNotificationTarget, summarizeCounts, computeBadgeFromCounts, parseMutedChannels,
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
   TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory, fetchThreadReplies,

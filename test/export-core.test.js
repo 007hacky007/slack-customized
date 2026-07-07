@@ -427,3 +427,29 @@ test('summarizeCounts returns mention totals and unread flag', () => {
   assert.equal(core.summarizeCounts({ ok: false }), null);
   assert.equal(core.summarizeCounts(undefined), null);
 });
+
+test('summarizeCounts excludes muted channels from unread dot but keeps mentions', () => {
+  const counts = {
+    ok: true,
+    channels: [
+      { id: 'C1', has_unreads: true, mention_count: 0 },   // muted -> no dot
+      { id: 'C2', has_unreads: true, mention_count: 2 },   // muted -> mention still counts
+    ],
+    ims: [], mpims: [], threads: { has_unreads: false, mention_count: 0 },
+  };
+  const muted = new Set(['C1', 'C2']);
+  assert.deepEqual(core.summarizeCounts(counts, muted), { mentions: 2, hasUnreads: false });
+  // without muting, the unread dot shows
+  assert.deepEqual(core.summarizeCounts(counts, new Set()), { mentions: 2, hasUnreads: true });
+  // an unmuted unread channel lights the dot
+  const c2 = { ok: true, channels: [{ id: 'C9', has_unreads: true, mention_count: 0 }] };
+  assert.deepEqual(core.summarizeCounts(c2, new Set(['C1'])), { mentions: 0, hasUnreads: true });
+});
+
+test('parseMutedChannels reads the comma-separated pref', () => {
+  assert.deepEqual([...core.parseMutedChannels({ ok: true, prefs: { muted_channels: 'C1,C2,C3' } })], ['C1', 'C2', 'C3']);
+  assert.deepEqual([...core.parseMutedChannels({ ok: true, prefs: { muted_channels: '' } })], []);
+  assert.deepEqual([...core.parseMutedChannels({ ok: true, prefs: {} })], []);
+  assert.deepEqual([...core.parseMutedChannels(null)], []);
+  assert.deepEqual([...core.parseMutedChannels({ prefs: { muted_channels: ' C1 , C2 ' } })], ['C1', 'C2']);
+});
