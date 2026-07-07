@@ -5,6 +5,11 @@ function parseClientUrl(pathname) {
   return m ? { teamId: m[1], channelId: m[2] } : null;
 }
 
+function parseClientTeam(pathname) {
+  const m = /\/client\/(T[A-Z0-9]+)/i.exec(pathname || '');
+  return m ? { teamId: m[1] } : null;
+}
+
 function getTokenForTeam(localConfigRaw, teamId) {
   try {
     const cfg = JSON.parse(localConfigRaw);
@@ -38,6 +43,8 @@ function sanitizeExportFilename(name, opts) {
   opts = opts || {};
   const fallback = opts.fallback || 'slack-export';
   const maxLength = opts.maxLength || 120;
+  const ext = /^[a-z0-9]{1,8}$/i.test(opts.ext || '') ? opts.ext.toLowerCase() : 'json';
+  const extRe = new RegExp('\\.' + ext + '$', 'i');
   let s = String(name == null ? '' : name);
   s = s.replace(/[\/\\]/g, '-');          // path separators
   s = s.replace(/[\x00-\x1f\x7f]/g, '');  // control chars
@@ -48,10 +55,10 @@ function sanitizeExportFilename(name, opts) {
   s = s.replace(/[-.\s]+$/, '');          // strip trailing dashes/dots/space
   s = s.trim();
   if (!s) s = fallback;
-  if (!/\.json$/i.test(s)) s = s + '.json';
+  if (!extRe.test(s)) s = s + '.' + ext;
   if (s.length > maxLength) {
-    const base = s.slice(0, maxLength - 5).replace(/[-.]+$/, '');
-    s = base + '.json';
+    const base = s.slice(0, maxLength - ext.length - 2).replace(/[-.]+$/, '');
+    s = base + '.' + ext;
   }
   return s;
 }
@@ -157,13 +164,14 @@ function createReport() {
   };
 }
 
-const TIERS = { history: 1200, reactions: 3000, users: 600, info: 1200, default: 1200 };
+const TIERS = { history: 1200, reactions: 3000, users: 600, info: 1200, list: 3000, default: 1200 };
 
 function methodTier(method) {
   if (method === 'conversations.history' || method === 'conversations.replies') return 'history';
   if (method === 'reactions.get') return 'reactions';
   if (method === 'users.info' || method === 'bots.info') return 'users';
   if (method === 'conversations.info' || method === 'conversations.genericInfo') return 'info';
+  if (method === 'users.conversations' || method === 'conversations.list') return 'list';
   return 'default';
 }
 function tierIntervalMs(method) { return TIERS[methodTier(method)] || TIERS.default; }
@@ -212,6 +220,60 @@ async function fetchAllHistory(apiCall, opts, hooks) {
     cursor = next;
   }
   return Array.from(map.values()).sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));
+}
+
+function normalizeChannelTypes(types) {
+  if (types === 'public_channel' || types === 'private_channel') return types;
+  return 'public_channel,private_channel';
+}
+
+function channelTypesLabel(types) {
+  const t = normalizeChannelTypes(types);
+  if (t === 'public_channel') return 'public';
+  if (t === 'private_channel') return 'private';
+  return 'all';
+}
+
+// Lists every channel the calling user is a member of (users.conversations only
+// returns the caller's memberships), filtered to public/private/both.
+async function fetchAllMemberChannels(apiCall, opts, hooks) {
+  opts = opts || {};
+  hooks = hooks || {};
+  const types = normalizeChannelTypes(opts.types);
+  const map = new Map();
+  let cursor = null;
+  for (;;) {
+    throwIfAborted(hooks.signal);
+    const params = { types, exclude_archived: true, limit: 200 };
+    if (cursor) params.cursor = cursor;
+    const resp = await apiCall('users.conversations', params);
+    if (!resp || resp.ok === false) throw new Error('users.conversations failed: ' + (resp && resp.error));
+    for (const c of (resp.channels || [])) {
+      if (c && c.id && !map.has(c.id)) map.set(c.id, c);
+    }
+    if (hooks.onProgress) hooks.onProgress('channels', map.size, null);
+    const next = getNextCursor(resp);
+    if (!next) break;
+    if (cursor && next === cursor) throw new Error('channel pagination stalled: cursor did not advance');
+    cursor = next;
+  }
+  return Array.from(map.values()).sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
+}
+
+function buildChannelListDoc(channels, ctx) {
+  ctx = ctx || {};
+  return {
+    exported_at: ctx.exportedAt || null,
+    exported_by: 'slack-autocomplete-electron',
+    workspace: ctx.workspace || null,
+    types: channelTypesLabel(ctx.types),
+    count: (channels || []).length,
+    channels: (channels || []).map((c) => ({ id: c.id, name: c.name || c.id, is_private: !!c.is_private })),
+  };
+}
+
+function formatChannelListText(channels) {
+  return (channels || []).map((c) => '#' + (c.name || c.id)).join('\n') + ((channels || []).length ? '\n' : '');
 }
 
 async function fetchThreadReplies(apiCall, opts, hooks) {
@@ -365,7 +427,8 @@ async function runExport(apiCall, ctx, hooks) {
 }
 
 module.exports = {
-  parseClientUrl, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
+  parseClientUrl, parseClientTeam, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
+  normalizeChannelTypes, channelTypesLabel, fetchAllMemberChannels, buildChannelListDoc, formatChannelListText,
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
   TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory, fetchThreadReplies,

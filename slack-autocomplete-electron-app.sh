@@ -491,6 +491,32 @@ function installApplicationMenu() {
             if (w) w.webContents.send('slack-autocomplete:export-channel');
           }
         },
+        {
+          label: 'Export Channel List',
+          submenu: [
+            {
+              label: 'Public Channels...',
+              click: (_item, focusedWindow) => {
+                const w = focusedWindow || BrowserWindow.getFocusedWindow();
+                if (w) w.webContents.send('slack-autocomplete:export-channel-list', { types: 'public_channel' });
+              }
+            },
+            {
+              label: 'Private Channels...',
+              click: (_item, focusedWindow) => {
+                const w = focusedWindow || BrowserWindow.getFocusedWindow();
+                if (w) w.webContents.send('slack-autocomplete:export-channel-list', { types: 'private_channel' });
+              }
+            },
+            {
+              label: 'All Channels...',
+              click: (_item, focusedWindow) => {
+                const w = focusedWindow || BrowserWindow.getFocusedWindow();
+                if (w) w.webContents.send('slack-autocomplete:export-channel-list', { types: 'public_channel,private_channel' });
+              }
+            }
+          ]
+        },
         { type: 'separator' },
         IS_MAC ? { role: 'close' } : { role: 'quit' }
       ]
@@ -1105,15 +1131,19 @@ ipcMain.handle('slack-autocomplete:api-call', async (event, payload = {}) => {
 
 ipcMain.handle('slack-autocomplete:save-export:begin', async (event, payload = {}) => {
   if (!isSlackSender(event)) throw new Error('export save rejected: untrusted sender');
+  // allowText: offer a Plain Text filter next to JSON; the format the user picks in
+  // the save dialog (via the chosen extension) is returned to the renderer.
+  const allowText = payload.allowText === true;
   const safe = exportCore.sanitizeExportFilename(payload.suggestedName || 'slack-export.json');
   const win = BrowserWindow.fromWebContents(event.sender);
   const defaultPath = path.join(app.getPath('downloads'), safe);
-  const res = await dialog.showSaveDialog(win, {
-    defaultPath,
-    filters: [{ name: 'JSON', extensions: ['json'] }]
-  });
+  const filters = allowText
+    ? [{ name: 'JSON', extensions: ['json'] }, { name: 'Plain Text', extensions: ['txt'] }]
+    : [{ name: 'JSON', extensions: ['json'] }];
+  const res = await dialog.showSaveDialog(win, { defaultPath, filters });
   if (res.canceled || !res.filePath) return { canceled: true };
   const finalPath = res.filePath;
+  const format = (allowText && /\.txt$/i.test(finalPath)) ? 'txt' : 'json';
   const tmpPath = finalPath + '.partial';
   const stream = fs.createWriteStream(tmpPath, { encoding: 'utf8' });
   const token = 'exp' + (++exportSaveCounter);
@@ -1126,7 +1156,7 @@ ipcMain.handle('slack-autocomplete:save-export:begin', async (event, payload = {
     exportSaveSessions.delete(token);
   };
   event.sender.once('destroyed', cleanupOnDestroy);
-  return { ok: true, token };
+  return { ok: true, token, format };
 });
 
 ipcMain.handle('slack-autocomplete:save-export:write', async (event, payload = {}) => {
@@ -3150,11 +3180,20 @@ cat > preload.js <<'EOF'
     return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
   }
 
-  function getExportConfig(log) {
+  function getExportConfig(log, opts) {
     log = log || function () {};
-    const ids = exportCore.parseClientUrl(window.location.pathname);
-    if (!ids) throw new Error('Open a channel first (no channel in the URL).');
-    log('url: teamId=' + ids.teamId + ' channelId=' + ids.channelId);
+    opts = opts || {};
+    let ids = exportCore.parseClientUrl(window.location.pathname);
+    if (!ids && opts.requireChannel === false) {
+      const team = exportCore.parseClientTeam(window.location.pathname);
+      if (team) ids = { teamId: team.teamId, channelId: null };
+    }
+    if (!ids) {
+      throw new Error(opts.requireChannel === false
+        ? 'Could not determine the workspace from the URL.'
+        : 'Open a channel first (no channel in the URL).');
+    }
+    log('url: teamId=' + ids.teamId + ' channelId=' + (ids.channelId || '(none)'));
     const raw = window.localStorage.getItem('localConfig_v2');
     const token = exportCore.getTokenForTeam(raw, ids.teamId);
     const apiBase = exportCore.inferApiBase(raw, ids.teamId);
@@ -3215,13 +3254,13 @@ cat > preload.js <<'EOF'
     };
   }
 
-  function createExportOverlay() {
+  function createExportOverlay(titleText) {
     const root = document.createElement('div');
     root.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;font-family:-apple-system,Segoe UI,sans-serif;';
     const box = document.createElement('div');
     box.style.cssText = 'background:#1d1c1d;color:#fff;min-width:480px;max-width:80vw;padding:20px 22px;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,0.5);';
     const title = document.createElement('div');
-    title.textContent = 'Exporting channel...';
+    title.textContent = titleText || 'Exporting channel...';
     title.style.cssText = 'font-weight:700;font-size:15px;margin-bottom:10px;';
     const phase = document.createElement('div');
     phase.style.cssText = 'font-size:13px;opacity:0.85;margin-bottom:10px;';
@@ -3230,6 +3269,14 @@ cat > preload.js <<'EOF'
     const bar = document.createElement('div');
     bar.style.cssText = 'height:100%;width:0;background:#36c5f0;transition:width 0.2s;';
     barWrap.appendChild(bar);
+    // Indeterminate animation for phases where the total is unknown (paginated fetches).
+    const styleEl = document.createElement('style');
+    styleEl.textContent = '@keyframes slack-export-indet { 0% { margin-left:-35%; } 100% { margin-left:100%; } }';
+    root.appendChild(styleEl);
+    function barDeterminate(pct) { bar.style.animation = ''; bar.style.marginLeft = '0'; bar.style.width = pct + '%'; }
+    function barIndeterminate() {
+      if (!bar.style.animation) { bar.style.width = '35%'; bar.style.animation = 'slack-export-indet 1.2s linear infinite'; }
+    }
     const logEl = document.createElement('pre');
     logEl.style.cssText = 'font-size:11px;line-height:1.45;color:#cfd3d6;background:#121212;border-radius:6px;padding:8px 10px;margin:0 0 12px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all;';
     const cancelBtn = document.createElement('button');
@@ -3253,16 +3300,17 @@ cat > preload.js <<'EOF'
         logEl.scrollTop = logEl.scrollHeight;
       },
       setProgress(label, cur, total) {
-        if (total && total > 0) { bar.style.width = Math.round((cur / total) * 100) + '%'; phase.textContent = label + ' ' + cur + ' / ' + total; }
-        else { phase.textContent = label + ' ' + cur + '...'; }
+        if (total && total > 0) { barDeterminate(Math.round((cur / total) * 100)); phase.textContent = label + ' ' + cur + ' / ' + total; }
+        else { barIndeterminate(); phase.textContent = label + ' ' + cur + '...'; }
       },
-      done(text) { title.textContent = 'Export complete'; phase.textContent = text; bar.style.width = '100%'; cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); },
-      fail(text) { title.textContent = 'Export failed'; phase.textContent = text; bar.style.background = '#e01e5a'; cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); },
+      done(text) { title.textContent = 'Export complete'; phase.textContent = text; barDeterminate(100); cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); },
+      fail(text) { title.textContent = 'Export failed'; phase.textContent = text; barDeterminate(100); bar.style.background = '#e01e5a'; cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); },
       destroy() { if (root.parentNode) root.remove(); },
     };
   }
 
   function phaseLabel(p) {
+    if (p === 'channels') return 'Fetching channels';
     if (p === 'messages') return 'Fetching messages';
     if (p === 'threads') return 'Fetching threads';
     if (p === 'thread-page') return 'Fetching thread replies';
@@ -3311,6 +3359,10 @@ cat > preload.js <<'EOF'
         onProgress: (p, cur, total) => {
           overlay.setProgress(phaseLabel(p), cur, total);
           if (p !== lastPhase) { lastPhase = p; log(phaseLabel(p) + '...'); }
+          // Verbose progress: unknown-total phases fire once per fetched page;
+          // known-total phases fire per item, so log milestones + the last one.
+          if (total && total > 0) { if (cur === total || cur % 25 === 0) log(phaseLabel(p) + ': ' + cur + ' / ' + total); }
+          else log(phaseLabel(p) + ': ' + cur + ' so far');
         },
       });
       log('assembled: ' + doc.export.counts.messages + ' messages, '
@@ -3335,7 +3387,63 @@ cat > preload.js <<'EOF'
       exportInProgress = false;
     }
   });
-  // =================== end channel JSON export ===================
+
+  // ===================== Channel list export (web API) =====================
+  // Exports the names + IDs of every channel the user is a member of
+  // (public, private, or both) as JSON or plain text (one channel per line).
+  ipcRenderer.on('slack-autocomplete:export-channel-list', async (_event, opts) => {
+    if (exportInProgress) return;
+    exportInProgress = true;
+    const types = exportCore.normalizeChannelTypes(opts && opts.types);
+    const typesLabel = exportCore.channelTypesLabel(types);
+    const overlay = createExportOverlay('Exporting channel list (' + typesLabel + ')...');
+    const log = (msg) => { try { console.log('[slack-export]', msg); } catch (e) {} overlay.appendLog(msg); };
+    const ac = new AbortController();
+    overlay.onCancel(() => { log('cancel requested'); ac.abort(); });
+    let saveToken = null;
+    try {
+      log('starting channel list export (' + typesLabel + ')');
+      const cfg = getExportConfig(log, { requireChannel: false });
+      const apiCall = createApiCall(cfg, ac.signal, log);
+      const workspace = exportCore.workspaceFromConfig(cfg.localConfigRaw, cfg.teamId);
+
+      const suggested = 'slack-channels-' + typesLabel + '-' + (workspace.name || cfg.teamId) + '-' + exportTsStamp() + '.json';
+      log('choosing save destination...');
+      const begin = await ipcRenderer.invoke('slack-autocomplete:save-export:begin', { suggestedName: suggested, allowText: true });
+      if (begin && begin.canceled) { log('save dialog canceled'); overlay.destroy(); return; }
+      saveToken = begin.token;
+      const format = begin.format === 'txt' ? 'txt' : 'json';
+      log('format: ' + format);
+
+      const channels = await exportCore.fetchAllMemberChannels(apiCall, { types }, {
+        signal: ac.signal,
+        onProgress: (p, cur, total) => {
+          overlay.setProgress(phaseLabel(p), cur, total);
+          log(phaseLabel(p) + ': ' + cur + ' so far');
+        },
+      });
+      log('fetched ' + channels.length + ' channels');
+
+      overlay.setPhase('Saving file...');
+      const content = format === 'txt'
+        ? exportCore.formatChannelListText(channels)
+        : JSON.stringify(exportCore.buildChannelListDoc(channels, {
+            exportedAt: new Date().toISOString(), workspace, types
+          }), null, 2) + '\n';
+      await ipcRenderer.invoke('slack-autocomplete:save-export:write', { token: saveToken, chunk: content });
+      const res = await ipcRenderer.invoke('slack-autocomplete:save-export:commit', { token: saveToken });
+      log('saved: ' + res.path);
+      overlay.done('Saved ' + channels.length + ' channels to ' + res.path);
+    } catch (e) {
+      log('FAILED: ' + ((e && e.message) || e));
+      if (saveToken) { try { await ipcRenderer.invoke('slack-autocomplete:save-export:abort', { token: saveToken }); } catch (e2) { /* ignore */ } }
+      if (e && e.name === 'AbortError') overlay.done('Export canceled.');
+      else overlay.fail(String((e && e.message) || e));
+    } finally {
+      exportInProgress = false;
+    }
+  });
+  // =================== end channel list export ===================
 
   if (document.readyState === 'loading') {
     window.addEventListener('DOMContentLoaded', init);

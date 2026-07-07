@@ -295,3 +295,84 @@ test('runExport assembles a complete document end-to-end', async () => {
   assert.equal(doc.export.complete, true);
   assert.deepEqual(doc.export.counts, { messages: 2, replies: 1, threads: 1, reactions: 1, truncated_reactions: 0, unresolved_actors: 0 });
 });
+
+test('parseClientTeam extracts team without a channel', () => {
+  assert.deepEqual(core.parseClientTeam('/client/T02MCKX93'), { teamId: 'T02MCKX93' });
+  assert.deepEqual(core.parseClientTeam('/client/T02MCKX93/C09LGFFFSD9'), { teamId: 'T02MCKX93' });
+  assert.equal(core.parseClientTeam('/client/'), null);
+  assert.equal(core.parseClientTeam(''), null);
+});
+
+test('sanitizeExportFilename honors ext option', () => {
+  assert.equal(core.sanitizeExportFilename('channels', { ext: 'txt' }), 'channels.txt');
+  assert.equal(core.sanitizeExportFilename('channels.txt', { ext: 'txt' }), 'channels.txt');
+  assert.equal(core.sanitizeExportFilename('', { ext: 'txt' }), 'slack-export.txt');
+  const long = core.sanitizeExportFilename('x'.repeat(500), { ext: 'txt' });
+  assert.ok(long.length <= 120);
+  assert.ok(long.endsWith('.txt'));
+  assert.equal(core.sanitizeExportFilename('a.json', { ext: '../evil' }), 'a.json'); // bad ext falls back to json
+});
+
+test('normalizeChannelTypes and channelTypesLabel', () => {
+  assert.equal(core.normalizeChannelTypes('public_channel'), 'public_channel');
+  assert.equal(core.normalizeChannelTypes('private_channel'), 'private_channel');
+  assert.equal(core.normalizeChannelTypes('public_channel,private_channel'), 'public_channel,private_channel');
+  assert.equal(core.normalizeChannelTypes(undefined), 'public_channel,private_channel');
+  assert.equal(core.normalizeChannelTypes('mpim'), 'public_channel,private_channel');
+  assert.equal(core.channelTypesLabel('public_channel'), 'public');
+  assert.equal(core.channelTypesLabel('private_channel'), 'private');
+  assert.equal(core.channelTypesLabel('anything-else'), 'all');
+});
+
+test('methodTier maps list methods to the list tier', () => {
+  assert.equal(core.methodTier('users.conversations'), 'list');
+  assert.equal(core.methodTier('conversations.list'), 'list');
+  assert.equal(core.tierIntervalMs('users.conversations'), 3000);
+});
+
+test('fetchAllMemberChannels paginates, dedupes and sorts by name', async () => {
+  const pages = {
+    'null': { ok: true, channels: [{ id: 'C2', name: 'zeta' }, { id: 'C1', name: 'alpha' }], response_metadata: { next_cursor: 'cur1' } },
+    'cur1': { ok: true, channels: [{ id: 'C2', name: 'zeta' }, { id: 'C3', name: 'mid', is_private: true }], response_metadata: { next_cursor: '' } },
+  };
+  const calls = [];
+  const apiCall = async (method, p) => {
+    calls.push({ method, p });
+    return pages[p.cursor || 'null'];
+  };
+  const out = await core.fetchAllMemberChannels(apiCall, { types: 'public_channel,private_channel' });
+  assert.deepEqual(out.map((c) => c.id), ['C1', 'C3', 'C2']);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].method, 'users.conversations');
+  assert.equal(calls[0].p.types, 'public_channel,private_channel');
+  assert.equal(calls[0].p.exclude_archived, true);
+  assert.equal(calls[1].p.cursor, 'cur1');
+});
+
+test('fetchAllMemberChannels throws on api error and stalled cursor', async () => {
+  await assert.rejects(
+    core.fetchAllMemberChannels(async () => ({ ok: false, error: 'invalid_auth' })),
+    /users\.conversations failed: invalid_auth/
+  );
+  const stalled = async (_m, p) => ({ ok: true, channels: [], response_metadata: { next_cursor: 'same' } });
+  await assert.rejects(core.fetchAllMemberChannels(stalled), /cursor did not advance/);
+});
+
+test('buildChannelListDoc keeps id, name, is_private and metadata', () => {
+  const doc = core.buildChannelListDoc(
+    [{ id: 'C1', name: 'general', is_private: false, topic: { value: 'noise' } }, { id: 'C2', is_private: true }],
+    { exportedAt: '2026-07-07T00:00:00.000Z', workspace: { team_id: 'T1', name: 'W' }, types: 'private_channel' }
+  );
+  assert.equal(doc.exported_at, '2026-07-07T00:00:00.000Z');
+  assert.equal(doc.types, 'private');
+  assert.equal(doc.count, 2);
+  assert.deepEqual(doc.channels, [
+    { id: 'C1', name: 'general', is_private: false },
+    { id: 'C2', name: 'C2', is_private: true },
+  ]);
+});
+
+test('formatChannelListText emits one channel per line', () => {
+  assert.equal(core.formatChannelListText([{ id: 'C1', name: 'general' }, { id: 'C2' }]), '#general\n#C2\n');
+  assert.equal(core.formatChannelListText([]), '');
+});
