@@ -951,7 +951,7 @@ function attachWindowStateTracking(win, initialUrl = SLACK_URL) {
   scheduleWindowStateSave();
 }
 
-function buildWindowOptions(overrides, extraArguments) {
+function buildWindowOptions(overrides) {
   const iconImage = getIconImage();
   const base = {
     width: 1200,
@@ -968,18 +968,20 @@ function buildWindowOptions(overrides, extraArguments) {
       nativeWindowOpen: true
     }
   };
-  if (Array.isArray(extraArguments) && extraArguments.length) {
-    base.webPreferences.additionalArguments = extraArguments;
-  }
   return Object.assign(base, overrides || {});
 }
 
-// Thread pop-outs open as slim windows showing only the thread. The pop-out
-// flag is passed as a renderer process argument (readable in the preload via
-// process.argv) instead of a URL fragment: Slack's client router rewrites the
-// URL and strips the hash within a second of load, so a fragment marker is
-// unreliable - the process argument survives all navigation.
-const THREAD_POPOUT_ARG = '--saw-thread-popout';
+// Per-WINDOW pop-out mode, keyed by webContents id and fetched by the preload
+// over IPC. Never use process arguments for this: Electron shares renderer
+// PROCESSES between same-origin windows, so a process-level flag leaks the
+// pop-out mode into the main window (its sidebar vanished) and pop-outs that
+// land in an unflagged process render the full client.
+const WINDOW_MODES = new Map(); // webContents.id -> { mode: 'thread'|'channel', threadUrl? }
+
+ipcMain.handle('slack-autocomplete:window-mode', (event) => {
+  if (!isSlackSender(event)) throw new Error('window-mode rejected: untrusted sender');
+  return WINDOW_MODES.get(event.sender.id) || { mode: 'normal' };
+});
 
 function isThreadUrl(targetUrl) {
   try {
@@ -1007,7 +1009,7 @@ function threadUrlToChannelUrl(threadUrl) {
 
 function openThreadPopout(targetUrl) {
   const channelUrl = threadUrlToChannelUrl(targetUrl);
-  return createWindow(channelUrl, { width: 520, height: 780 }, [THREAD_POPOUT_ARG, '--saw-thread-url=' + String(targetUrl)]);
+  return createWindow(channelUrl, { width: 520, height: 780 }, { mode: 'thread', threadUrl: String(targetUrl) });
 }
 
 function triggerDownload(url) {
@@ -1270,8 +1272,13 @@ function installHideOnClose(win) {
   });
 }
 
-function createWindow(initialUrl = SLACK_URL, windowOverrides, extraArguments) {
-  const win = new BrowserWindow(buildWindowOptions(windowOverrides, extraArguments));
+function createWindow(initialUrl = SLACK_URL, windowOverrides, windowMode) {
+  const win = new BrowserWindow(buildWindowOptions(windowOverrides));
+  if (windowMode && windowMode.mode) {
+    const wcId = win.webContents.id;
+    WINDOW_MODES.set(wcId, windowMode);
+    win.webContents.once('destroyed', () => WINDOW_MODES.delete(wcId));
+  }
   applyWindowPolicies(win);
   installHideOnClose(win);
   win.loadURL(initialUrl);
@@ -1293,8 +1300,8 @@ ipcMain.handle('slack-autocomplete:open-window', async (_event, targetUrl) => {
     openThreadPopout(targetUrl);
   } else if (isSlackAppNavigationUrl(targetUrl)) {
     // Channel "Open in new window": official shows just the channel view
-    // (no rail/sidebar/top nav) - the preload isolates it via this flag.
-    createWindow(targetUrl, undefined, ['--saw-channel-popout']);
+    // (no rail/sidebar/top nav) - the preload learns the mode over IPC.
+    createWindow(targetUrl, undefined, { mode: 'channel' });
   } else {
     createWindow(targetUrl);
   }
@@ -1710,30 +1717,32 @@ cat > preload.js <<'EOF'
       return false;
     }
   })();
-  // Thread pop-out windows are flagged by the main process via a renderer
-  // process argument (survives Slack's URL/hash rewriting). Shows only the
-  // thread pane, like the official app's thread windows.
-  const THREAD_POPOUT_MODE = (() => {
-    try {
-      return process.argv.includes('--saw-thread-popout');
-    } catch (err) {
-      return false;
+  // Pop-out mode is PER WINDOW, fetched from the main process over IPC
+  // (keyed by webContents id). Never derive it from process.argv: Electron
+  // shares renderer processes between same-origin windows, so a process-level
+  // flag leaked pop-out mode into the main window (hiding its sidebar) and
+  // pop-outs in an unflagged process rendered the full client.
+  let THREAD_POPOUT_MODE = false;
+  let CHANNEL_POPOUT_MODE = false;
+  let THREAD_POPOUT_URL = null;
+  const windowModeReady = (async () => {
+    if (!ipcRenderer) return;
+    let m = null;
+    try { m = await ipcRenderer.invoke('slack-autocomplete:window-mode'); } catch (err) { m = null; }
+    if (!m || m.mode === 'normal') {
+      // The sender-frame check can race the frame URL during early preload;
+      // retry once when the document is ready.
+      await new Promise((resolve) => {
+        if (document.readyState !== 'loading') resolve();
+        else window.addEventListener('DOMContentLoaded', resolve, { once: true });
+      });
+      try { m = await ipcRenderer.invoke('slack-autocomplete:window-mode'); } catch (err) { /* keep first result */ }
     }
-  })();
-  const THREAD_POPOUT_URL = (() => {
-    try {
-      const a = (process.argv || []).find((x) => typeof x === 'string' && x.indexOf('--saw-thread-url=') === 0);
-      return a ? a.slice('--saw-thread-url='.length) : null;
-    } catch (err) {
-      return null;
-    }
-  })();
-  // Channel pop-out windows show just the channel view (official-app style).
-  const CHANNEL_POPOUT_MODE = (() => {
-    try {
-      return process.argv.includes('--saw-channel-popout');
-    } catch (err) {
-      return false;
+    if (m && m.mode === 'thread') {
+      THREAD_POPOUT_MODE = true;
+      THREAD_POPOUT_URL = typeof m.threadUrl === 'string' ? m.threadUrl : null;
+    } else if (m && m.mode === 'channel') {
+      CHANNEL_POPOUT_MODE = true;
     }
   })();
   const IS_MAC_PRELOAD = (() => {
@@ -3795,15 +3804,17 @@ cat > preload.js <<'EOF'
     setupAutocompleteObservers();
     setupChannelContextMenuSupport();
     setupAttachmentEscape();
-    if (THREAD_POPOUT_MODE) {
-      applyThreadPopoutMode();
-    } else if (CHANNEL_POPOUT_MODE) {
-      applyChannelPopoutMode();
-      setupThreadWatcher(); // threads can still pop out from a channel window
-    } else {
-      applyHiddenTitleBarPadding();
-      setupThreadWatcher(); // no pop-out button inside a thread pop-out window
-    }
+    windowModeReady.then(() => {
+      if (THREAD_POPOUT_MODE) {
+        applyThreadPopoutMode();
+      } else if (CHANNEL_POPOUT_MODE) {
+        applyChannelPopoutMode();
+        setupThreadWatcher(); // threads can still pop out from a channel window
+      } else {
+        applyHiddenTitleBarPadding();
+        setupThreadWatcher(); // no pop-out button inside a thread pop-out window
+      }
+    });
     setupBadgeUpdater();
     setupDownloadsPanel();
     setupTeamsReporter();
@@ -3951,12 +3962,17 @@ cat > preload.js <<'EOF'
     setInterval(tick, 300);
   }
 
-  // Channel pop-out: rather than isolate a "content pane" (Slack's channel
-  // content class varies across view states - primary / split / secondary -
-  // so anchoring on it is unreliable), remove the two chrome elements we
-  // always want gone and collapse their grid tracks. This is view-state
-  // independent: the tab rail and channel sidebar live at stable positions in
-  // the workspace grid (verified live: wrapper grid = "[rail] [workspace]").
+  // Channel pop-out. Recipe verified live over CDP against a real pop-out
+  // window (screenshot-matched to the official app's channel window):
+  //   - hide by stable class: rail, sidebar, control strip (the +/theme/
+  //     avatar buttons), global top nav
+  //   - collapse the leftover grid tracks: the rail column on the wrapper and
+  //     the sidebar column on the tabpanel (Slack's fresh-boot DOM places the
+  //     sidebar INSIDE the tabpanel grid: areas "sidebar primary"). The :has()
+  //     rule only adjusts columns, never display, so it cannot nuke content.
+  //   - a JS tick hides stray hash-classed gutter containers at the layout
+  //     level (other boot variants put the sidebar wrapper there); React
+  //     focus wrappers (display:contents) are left alone.
   function applyChannelPopoutMode() {
     document.documentElement.classList.add('saw-channel-popout');
     installPopoutChromeStyle('saw-channel-popout', '.p-view_header, [data-qa="channel_header"]');
@@ -3967,27 +3983,30 @@ cat > preload.js <<'EOF'
       'html.saw-channel-popout [data-qa="tab_rail_desktop"],',
       'html.saw-channel-popout .p-channel_sidebar,',
       'html.saw-channel-popout .p-view_contents--sidebar,',
-      // The sidebar sits inside a hash-classed wrapper that owns the grid
-      // column - hide the wrapper too or an empty gutter remains.
-      'html.saw-channel-popout .p-client_workspace__layout > :has(.p-view_contents--sidebar),',
-      'html.saw-channel-popout .p-client_workspace__layout > :has(.p-channel_sidebar),',
       'html.saw-channel-popout [data-qa="channel_sidebar"],',
-      // The official channel window has no global top nav (search bar); the
-      // channel header sits at the very top and holds the traffic lights.
+      'html.saw-channel-popout .p-control_strip,',
       'html.saw-channel-popout .p-ia4_top_nav { display: none !important; }',
-      // Collapse the rail column so the workspace fills the window.
-      'html.saw-channel-popout .p-client_workspace_wrapper { grid-template-columns: 0 1fr !important; }'
+      'html.saw-channel-popout .p-client_workspace_wrapper { grid-template-columns: 0 1fr !important; }',
+      'html.saw-channel-popout .p-client_workspace__tabpanel:has(.p-view_contents--sidebar) { grid-template-columns: 0 1fr !important; }'
     ].join('\n');
     (document.head || document.documentElement).appendChild(style);
     installPopoutCover();
-    // Reveal once the client shell (top nav or a view header) has rendered.
     const startedAt = Date.now();
     const tick = () => {
-      if (document.querySelector('.p-view_header, .p-ia4_top_nav, [data-qa="message_pane"]')) removePopoutCover();
+      const layout = document.querySelector('.p-client_workspace__layout');
+      if (layout) {
+        for (const el of Array.from(layout.children)) {
+          if (el.classList.contains('p-client_workspace__tabpanel')) continue;
+          if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE') continue;
+          if (getComputedStyle(el).display === 'contents') continue;
+          el.style.setProperty('display', 'none', 'important');
+        }
+      }
+      if (document.querySelector('.p-view_header, [data-qa="message_pane"]')) removePopoutCover();
       if (Date.now() - startedAt > 20000) removePopoutCover();
     };
     tick();
-    setInterval(tick, 300);
+    setInterval(tick, 500);
   }
 
   // hiddenInset title bar in regular windows: pad Slack's top nav so its
