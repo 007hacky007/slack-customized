@@ -951,9 +951,9 @@ function attachWindowStateTracking(win, initialUrl = SLACK_URL) {
   scheduleWindowStateSave();
 }
 
-function buildWindowOptions() {
+function buildWindowOptions(overrides) {
   const iconImage = getIconImage();
-  return {
+  return Object.assign({
     width: 1200,
     height: 800,
     icon: iconImage,
@@ -964,7 +964,25 @@ function buildWindowOptions() {
       sandbox: false,
       nativeWindowOpen: true
     }
-  };
+  }, overrides || {});
+}
+
+// Thread pop-outs open as slim windows showing only the thread (the preload
+// hides the rest of the client when it sees the marker), like the official app.
+const THREAD_POPOUT_MARKER = 'saw-thread-popout';
+
+function isThreadUrl(targetUrl) {
+  try {
+    return isSlackUrl(targetUrl) && new URL(targetUrl).pathname.includes('/thread/');
+  } catch (err) {
+    return false;
+  }
+}
+
+function openThreadPopout(targetUrl) {
+  let u = String(targetUrl);
+  if (!u.includes(THREAD_POPOUT_MARKER)) u += '#' + THREAD_POPOUT_MARKER;
+  return createWindow(u, { width: 520, height: 780 });
 }
 
 function triggerDownload(url) {
@@ -1227,8 +1245,8 @@ function installHideOnClose(win) {
   });
 }
 
-function createWindow(initialUrl = SLACK_URL) {
-  const win = new BrowserWindow(buildWindowOptions());
+function createWindow(initialUrl = SLACK_URL, windowOverrides) {
+  const win = new BrowserWindow(buildWindowOptions(windowOverrides));
   applyWindowPolicies(win);
   installHideOnClose(win);
   win.loadURL(initialUrl);
@@ -1246,7 +1264,11 @@ ipcMain.handle('slack-autocomplete:open-window', async (_event, targetUrl) => {
     return { status: 'external-opened' };
   }
 
-  createWindow(targetUrl);
+  if (isThreadUrl(targetUrl)) {
+    openThreadPopout(targetUrl);
+  } else {
+    createWindow(targetUrl);
+  }
   return { status: 'created' };
 });
 
@@ -1357,6 +1379,14 @@ ipcMain.handle('slack-autocomplete:context-menu', (event, payload = {}) => {
   const contents = event.sender;
   const { selectionText = '', isEditable = false, hasSelection = false, canGoBack: rendererCanGoBack = false } = payload;
   const template = [];
+
+  if (typeof payload.threadUrl === 'string' && isThreadUrl(payload.threadUrl)) {
+    const threadUrl = payload.threadUrl;
+    template.push({
+      label: 'Open Thread in New Window',
+      click: () => openThreadPopout(threadUrl)
+    }, { type: 'separator' });
+  }
 
   const canGoBack = Boolean(rendererCanGoBack) || (contents && contents.canGoBack && contents.canGoBack());
 
@@ -1647,6 +1677,15 @@ cat > preload.js <<'EOF'
   const DEBUG = (() => {
     try {
       return Boolean(window?.localStorage?.getItem('slackAutocompleteDebug'));
+    } catch (err) {
+      return false;
+    }
+  })();
+  // Thread pop-out windows (marker set by the main process) show only the
+  // thread pane, like the official app's thread windows.
+  const THREAD_POPOUT_MODE = (() => {
+    try {
+      return window.location.hash.includes('saw-thread-popout');
     } catch (err) {
       return false;
     }
@@ -2037,13 +2076,25 @@ cat > preload.js <<'EOF'
       'contextmenu',
       (event) => {
         try {
+          // Slack's client renders its own context menu on messages, links,
+          // etc. and calls preventDefault when it does. Showing our native
+          // menu on top of it double-stacked the menus - official behavior
+          // is Slack's menu only wherever the client provides one.
+          if (event.defaultPrevented) return;
+
           const selection = window.getSelection ? window.getSelection() : null;
           const selectionText = selection ? String(selection).trim() : '';
           const isEditable = isEditableTarget(event.target);
           const hasSelection = Boolean(selectionText);
           const canGoBack = true; // Always expose Go Back in menu; enable/disable in main process.
 
-          // Always allow opening to show Go Back even if no text selection.
+          // Right-clicks inside the thread pane offer the official-style
+          // "Open Thread in New Window" (not inside an existing pop-out).
+          let threadUrl = null;
+          if (!THREAD_POPOUT_MODE && event.target instanceof Element
+            && event.target.closest('.p-workspace__secondary_view, .p-flexpane, [data-qa="threads_flexpane"]')) {
+            try { threadUrl = getCurrentThreadUrl(false); } catch (err) { threadUrl = null; }
+          }
 
           event.preventDefault();
 
@@ -2051,7 +2102,8 @@ cat > preload.js <<'EOF'
             selectionText,
             hasSelection,
             isEditable,
-            canGoBack
+            canGoBack,
+            threadUrl
           });
         } catch (err) {
           log('Context menu error', err);
@@ -3549,7 +3601,11 @@ cat > preload.js <<'EOF'
     setupAutocompleteObservers();
     setupChannelContextMenuSupport();
     setupAttachmentEscape();
-    setupThreadWatcher();
+    if (THREAD_POPOUT_MODE) {
+      applyThreadPopoutMode();
+    } else {
+      setupThreadWatcher(); // no pop-out button inside a pop-out window
+    }
     setupBadgeUpdater();
     setupDownloadsPanel();
     setupTeamsReporter();
@@ -3557,6 +3613,23 @@ cat > preload.js <<'EOF'
     installIdleDetector();
     log('Slack autocomplete preload initialized.');
     exposeDebugHelpers();
+  }
+
+  // Thread-only pop-out: hide everything except the thread pane so the window
+  // shows just the thread, like the official app's thread windows.
+  function applyThreadPopoutMode() {
+    if (document.getElementById('slack-autocomplete-thread-popout-style')) return;
+    const style = document.createElement('style');
+    style.id = 'slack-autocomplete-thread-popout-style';
+    style.textContent = [
+      '.p-tab_rail, .p-workspace__sidebar, .p-top_nav, .p-control_strip,',
+      '.p-workspace__banner, .p-workspace__primary_view { display: none !important; }',
+      '.p-workspace__secondary_view, .p-flexpane {',
+      '  position: fixed !important; inset: 0 !important;',
+      '  width: 100vw !important; max-width: 100vw !important; height: 100vh !important;',
+      '}'
+    ].join('\n');
+    (document.head || document.documentElement).appendChild(style);
   }
 
   // ===================== Downloads panel (official-style pane) =====================
