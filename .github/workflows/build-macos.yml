@@ -1,0 +1,78 @@
+name: Build macOS app
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run export-core tests
+        run: node --test test/export-core.test.js
+
+  build:
+    name: Build .app (Apple Silicon)
+    needs: test
+    runs-on: macos-latest
+    env:
+      APP_NAME: SlackAutocompleteElectron
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify Apple Silicon runner
+        run: |
+          ARCH="$(uname -m)"
+          echo "Runner arch: $ARCH"
+          if [[ "$ARCH" != "arm64" ]]; then
+            echo "Expected an arm64 (Apple Silicon) runner, got $ARCH" >&2
+            exit 1
+          fi
+
+      - name: Build app
+        run: ./slack-autocomplete-electron-app.sh
+
+      - name: Ad-hoc codesign
+        run: |
+          APP_PATH="$HOME/$APP_NAME/dist/${APP_NAME}-darwin-arm64/${APP_NAME}.app"
+          codesign --force --deep --sign - "$APP_PATH"
+          codesign --verify --verbose=2 "$APP_PATH"
+
+      - name: Zip .app (ditto preserves symlinks and bundle metadata)
+        run: |
+          APP_PATH="$HOME/$APP_NAME/dist/${APP_NAME}-darwin-arm64/${APP_NAME}.app"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "${APP_NAME}-macos-arm64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SlackAutocompleteElectron-macos-arm64
+          path: SlackAutocompleteElectron-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Usage note
+        run: |
+          {
+            echo "### macOS app built (arm64)"
+            echo ""
+            echo "Download the artifact, unzip it, then clear the quarantine flag"
+            echo "(the app is ad-hoc signed, not notarized):"
+            echo ""
+            echo '```'
+            echo "xattr -cr ${APP_NAME}.app"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
