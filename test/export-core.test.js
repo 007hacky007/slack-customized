@@ -417,13 +417,17 @@ test('computeBadgeFromCounts sums mentions, falls back to unread dot', () => {
 });
 
 test('summarizeCounts returns mention totals and unread flag', () => {
-  assert.deepEqual(core.summarizeCounts({
+  const s = core.summarizeCounts({
     ok: true,
     channels: [{ id: 'C1', mention_count: 2, has_unreads: true }],
     ims: [{ id: 'D1', dm_count: 1 }],
     threads: { mention_count: 1 },
-  }), { mentions: 4, hasUnreads: true });
-  assert.deepEqual(core.summarizeCounts({ ok: true }), { mentions: 0, hasUnreads: false });
+  });
+  assert.equal(s.mentions, 4);
+  assert.equal(s.hasUnreads, true);
+  const empty = core.summarizeCounts({ ok: true });
+  assert.equal(empty.mentions, 0);
+  assert.equal(empty.hasUnreads, false);
   assert.equal(core.summarizeCounts({ ok: false }), null);
   assert.equal(core.summarizeCounts(undefined), null);
 });
@@ -438,12 +442,16 @@ test('summarizeCounts excludes muted channels from unread dot but keeps mentions
     ims: [], mpims: [], threads: { has_unreads: false, mention_count: 0 },
   };
   const muted = new Set(['C1', 'C2']);
-  assert.deepEqual(core.summarizeCounts(counts, muted), { mentions: 2, hasUnreads: false });
+  const s = core.summarizeCounts(counts, muted);
+  assert.equal(s.mentions, 2);
+  assert.equal(s.hasUnreads, false);
   // without muting, the unread dot shows
-  assert.deepEqual(core.summarizeCounts(counts, new Set()), { mentions: 2, hasUnreads: true });
+  const s2 = core.summarizeCounts(counts, new Set());
+  assert.equal(s2.mentions, 2);
+  assert.equal(s2.hasUnreads, true);
   // an unmuted unread channel lights the dot
   const c2 = { ok: true, channels: [{ id: 'C9', has_unreads: true, mention_count: 0 }] };
-  assert.deepEqual(core.summarizeCounts(c2, new Set(['C1'])), { mentions: 0, hasUnreads: true });
+  assert.equal(core.summarizeCounts(c2, new Set(['C1'])).hasUnreads, true);
 });
 
 test('parseMutedChannels reads the comma-separated pref', () => {
@@ -452,4 +460,53 @@ test('parseMutedChannels reads the comma-separated pref', () => {
   assert.deepEqual([...core.parseMutedChannels({ ok: true, prefs: {} })], []);
   assert.deepEqual([...core.parseMutedChannels(null)], []);
   assert.deepEqual([...core.parseMutedChannels({ prefs: { muted_channels: ' C1 , C2 ' } })], ['C1', 'C2']);
+});
+
+test('parseMutedChannels reads all_notifications_prefs (muted_channels is gone from live prefs)', () => {
+  // verified live 2026-07-07: users.prefs.get returns no muted_channels key;
+  // muting lives in all_notifications_prefs channels[id].muted
+  const anp = JSON.stringify({
+    global: { global_desktop: 'mentions_dms' },
+    channels: {
+      C1: { desktop: 'everything', muted: true },
+      C2: { desktop: 'everything', muted: false },
+      G3: { muted: true },
+    },
+  });
+  assert.deepEqual([...core.parseMutedChannels({ ok: true, prefs: { all_notifications_prefs: anp } })].sort(), ['C1', 'G3']);
+  // union with the legacy pref when both are present
+  assert.deepEqual(
+    [...core.parseMutedChannels({ ok: true, prefs: { muted_channels: 'C9', all_notifications_prefs: anp } })].sort(),
+    ['C1', 'C9', 'G3']
+  );
+  // malformed JSON is ignored
+  assert.deepEqual([...core.parseMutedChannels({ ok: true, prefs: { all_notifications_prefs: '{bad' } })], []);
+});
+
+test('parseShowBullet reads mac_ssb_bullet, defaults true', () => {
+  assert.equal(core.parseShowBullet({ ok: true, prefs: { mac_ssb_bullet: true } }), true);
+  assert.equal(core.parseShowBullet({ ok: true, prefs: { mac_ssb_bullet: false } }), false);
+  assert.equal(core.parseShowBullet({ ok: true, prefs: {} }), true);
+  assert.equal(core.parseShowBullet(null), true);
+});
+
+test('summarizeCounts reports the non-muted unread conversation ids', () => {
+  const counts = {
+    ok: true,
+    channels: [
+      { id: 'C1', has_unreads: true, mention_count: 0 },
+      { id: 'C2', has_unreads: true, mention_count: 0 },
+      { id: 'C3', has_unreads: false, mention_count: 0 },
+    ],
+    ims: [{ id: 'D1', has_unreads: true, dm_count: 0 }],
+    mpims: [],
+    threads: { has_unreads: true, mention_count: 0 },
+  };
+  const s = core.summarizeCounts(counts, new Set(['C2']));
+  assert.deepEqual(s.unreadIds.sort(), ['C1', 'D1']);
+  assert.equal(s.threadsUnread, true);
+  assert.equal(s.hasUnreads, true);
+  const s2 = core.summarizeCounts({ ok: true, channels: [] });
+  assert.deepEqual(s2.unreadIds, []);
+  assert.equal(s2.threadsUnread, false);
 });

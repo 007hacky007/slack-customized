@@ -150,10 +150,17 @@ each preload fetch it over IPC (survives reloads too).
   is posted with the user's `xoxc` token via `chat.postMessage`. Conversation
   id + ts are recoverable from the options Slack passes to `new
   Notification()`.
-- Exact dock badge: poll `client.counts` (the client's own undocumented
-  endpoint) for mention totals, but keep the window title as the instant
-  source of truth for whether anything is unread; `client.counts
-  has_unreads` includes muted channels and lags reads.
+- Exact dock badge (decompiled from Slack.app main bundle, verified via CDP
+  + lsappinfo): number = unreadHighlights (mentions/DMs), else dot when any
+  unread exists and the `mac_ssb_bullet` pref is on, else empty. "Unread"
+  excludes muted AND archived conversations; `client.counts has_unreads`
+  flags both, so filter them (muted now lives in the
+  `all_notifications_prefs` JSON pref - `prefs.muted_channels` is gone from
+  live `users.prefs.get`; archived needs a `conversations.info` check).
+  `client.counts channel_badges` is NOT the badge source (stays 0 for plain
+  unreads). Window titles DO carry unread markers ("* ... - N new items -
+  Slack", muted-aware) - an earlier note here claiming otherwise was
+  mis-verified while every unread happened to be muted.
 - The permission gate gained microphone/camera/display-capture for huddles;
   match hostnames strictly (`https:` + exact/suffix match), never
   `url.includes('slack.com')`. Screen sharing uses the native macOS picker

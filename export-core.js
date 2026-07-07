@@ -267,36 +267,55 @@ function extractNotificationTarget(options) {
 // undocumented API. Returns null when the response is unusable.
 // mutedIds (optional Set): muted conversations are excluded from the unread
 // dot (like the official badge) but their mentions still count.
+// unreadIds lists the non-muted conversations behind hasUnreads so the caller
+// can drop ones the official badge ignores (archived channels report
+// has_unreads=true in client.counts but never badge).
 function summarizeCounts(counts, mutedIds) {
   if (!counts || counts.ok === false) return null;
   const muted = mutedIds instanceof Set ? mutedIds : new Set();
   let mentions = 0;
-  let unread = false;
+  const unreadIds = [];
   const buckets = [counts.channels, counts.mpims, counts.ims];
   for (const list of buckets) {
     for (const item of (Array.isArray(list) ? list : [])) {
       if (!item) continue;
       mentions += (item.mention_count | 0) + (item.dm_count | 0);
-      if (item.has_unreads && !muted.has(item.id)) unread = true;
+      if (item.has_unreads && !muted.has(item.id)) unreadIds.push(item.id);
     }
   }
+  let threadsUnread = false;
   if (counts.threads) {
     mentions += counts.threads.mention_count | 0;
-    if (counts.threads.has_unreads) unread = true;
+    threadsUnread = !!counts.threads.has_unreads;
   }
-  return { mentions, hasUnreads: unread };
+  return { mentions, hasUnreads: threadsUnread || unreadIds.length > 0, unreadIds, threadsUnread };
 }
 
-// Extracts the muted conversation ids from a users.prefs.get response
-// (prefs.muted_channels is a comma-separated id list).
+// Extracts the muted conversation ids from a users.prefs.get response.
+// Historically prefs.muted_channels (comma-separated ids); the live API
+// (verified 2026-07-07) no longer returns that key - muting moved into the
+// all_notifications_prefs JSON pref as channels[id].muted. Parse both.
 function parseMutedChannels(prefsResponse) {
-  const raw = prefsResponse && prefsResponse.prefs && prefsResponse.prefs.muted_channels;
+  const prefs = (prefsResponse && prefsResponse.prefs) || {};
   const out = new Set();
-  for (const id of String(raw || '').split(',')) {
+  for (const id of String(prefs.muted_channels || '').split(',')) {
     const t = id.trim();
     if (t) out.add(t);
   }
+  try {
+    const anp = JSON.parse(prefs.all_notifications_prefs);
+    for (const [id, p] of Object.entries((anp && anp.channels) || {})) {
+      if (p && p.muted) out.add(id);
+    }
+  } catch (e) { /* pref absent or malformed */ }
   return out;
+}
+
+// Whether the user wants the unread dot on the dock icon. The official app
+// gates its bullet on the mac_ssb_bullet pref (default on).
+function parseShowBullet(prefsResponse) {
+  const prefs = (prefsResponse && prefsResponse.prefs) || {};
+  return prefs.mac_ssb_bullet !== false;
 }
 
 function computeBadgeFromCounts(counts) {
@@ -513,7 +532,7 @@ async function runExport(apiCall, ctx, hooks) {
 module.exports = {
   parseClientUrl, parseClientTeam, getTokenForTeam, inferApiBase, workspaceFromConfig, sanitizeExportFilename,
   normalizeChannelTypes, channelTypesLabel, fetchAllMemberChannels, buildChannelListDoc, formatChannelListText,
-  extractNotificationTarget, summarizeCounts, computeBadgeFromCounts, parseMutedChannels,
+  extractNotificationTarget, summarizeCounts, computeBadgeFromCounts, parseMutedChannels, parseShowBullet,
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
   TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory, fetchThreadReplies,

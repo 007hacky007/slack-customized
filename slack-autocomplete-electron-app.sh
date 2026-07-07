@@ -3758,29 +3758,52 @@ cat > preload.js <<'EOF'
   }
 
   function setupBadgeUpdater() {
-    // client.counts is the authoritative badge source: modern Slack titles
-    // carry no unread markers at all (verified live: no '*'/'!' prefix, no
-    // '(N)'), so the old title heuristic can never fire. Muted conversations
-    // (users.prefs.get muted_channels) are excluded from the unread dot like
-    // the official badge. Reads are picked up quickly via repolls triggered
-    // by title changes (channel switches) and window focus.
+    // client.counts drives the badge, mimicking the official app (algorithm
+    // decompiled from Slack.app's main bundle and verified live over CDP):
+    //   mentions/DM count > 0            -> numbered badge
+    //   else any qualifying unread       -> dot, gated on the mac_ssb_bullet
+    //   else                             -> no badge
+    // A qualifying unread is a non-muted, non-archived conversation with
+    // has_unreads (client.counts flags muted and archived ones too, but the
+    // official badge ignores them). Muting lives in the
+    // all_notifications_prefs JSON pref (users.prefs.get); archived status is
+    // checked once per flagged id via conversations.info and cached. Reads
+    // are picked up quickly via repolls triggered by title changes (channel
+    // switches) and window focus.
     const COUNTS_POLL_INTERVAL_MS = 30000;
     const MUTED_POLL_INTERVAL_MS = 600000;
     let countsMentions = 0;
     let countsUnread = false;
     let haveCounts = false;
     let mutedIds = new Set();
+    let showBullet = true;
+    const archivedById = new Map();
     let refreshHandles = [];
 
-    const apiCall = async (method) => {
+    const apiCall = async (method, params = {}) => {
       const teamId = exportCore.parseClientTeam(window.location.pathname)?.teamId;
       const raw = window.localStorage.getItem('localConfig_v2');
       const token = teamId ? exportCore.getTokenForTeam(raw, teamId) : null;
       const apiBase = teamId ? exportCore.inferApiBase(raw, teamId) : null;
       if (!token || !apiBase || !ipcRenderer) return null;
       return ipcRenderer.invoke('slack-autocomplete:api-call', {
-        apiBase, teamId, token, method, params: {}
+        apiBase, teamId, token, method, params
       });
+    };
+
+    const isArchived = async (id) => {
+      if (archivedById.has(id)) return archivedById.get(id);
+      try {
+        const res = await apiCall('conversations.info', { channel: id });
+        if (res?.json?.ok) {
+          const archived = !!res.json.channel?.is_archived;
+          archivedById.set(id, archived);
+          return archived;
+        }
+      } catch (err) {
+        log('conversations.info failed', err);
+      }
+      return false; // unknown: assume live, retry next poll (not cached)
     };
 
     const applyBadge = () => {
@@ -3796,9 +3819,14 @@ cat > preload.js <<'EOF'
         const res = await apiCall('client.counts');
         const summary = exportCore.summarizeCounts(res?.json, mutedIds);
         if (!summary) return;
+        let unread = summary.threadsUnread;
+        for (const id of summary.unreadIds) {
+          if (unread) break;
+          if (!(await isArchived(id))) unread = true;
+        }
         haveCounts = true;
         countsMentions = summary.mentions;
-        countsUnread = summary.hasUnreads;
+        countsUnread = unread && showBullet;
         applyBadge();
       } catch (err) {
         log('client.counts poll failed', err);
@@ -3808,7 +3836,10 @@ cat > preload.js <<'EOF'
     const pollMuted = async () => {
       try {
         const res = await apiCall('users.prefs.get');
-        if (res?.json?.ok) mutedIds = exportCore.parseMutedChannels(res.json);
+        if (res?.json?.ok) {
+          mutedIds = exportCore.parseMutedChannels(res.json);
+          showBullet = exportCore.parseShowBullet(res.json);
+        }
       } catch (err) {
         log('users.prefs.get poll failed', err);
       }
