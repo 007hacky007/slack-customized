@@ -132,7 +132,8 @@ const {
   Menu,
   dialog,
   net,
-  powerMonitor
+  powerMonitor,
+  desktopCapturer
 } = require('electron');
 const fs = require('fs');
 const path = require('path');
@@ -276,24 +277,44 @@ function normalizeSlackDeepLink(targetUrl) {
   }
 }
 
+function teamOfUrl(targetUrl) {
+  const m = /\/client\/(T[A-Z0-9]+)/i.exec(String(targetUrl || ''));
+  return m ? m[1] : null;
+}
+
+function windowTeam(win) {
+  return teamOfUrl(win && win.__slackLastUrl);
+}
+
 function focusOrCreateWindow(targetUrl = SLACK_URL) {
   const normalized = isSlackUrl(targetUrl) ? targetUrl : SLACK_URL;
   const windows = BrowserWindow.getAllWindows().filter((win) => win && !win.isDestroyed());
-  const first = windows[0];
 
-  if (first) {
+  // Multi-workspace routing like the official app: a link for workspace X goes
+  // to the window already showing X; otherwise the focused/first window
+  // switches workspace in place (the same thing the official rail does).
+  const targetTeam = teamOfUrl(normalized);
+  let target = null;
+  if (targetTeam) target = windows.find((w) => windowTeam(w) === targetTeam) || null;
+  if (!target) target = BrowserWindow.getFocusedWindow() || windows[0] || null;
+
+  if (target) {
     try {
       // Prefer sending a soft navigation to the existing renderer to avoid full reloads.
-      const routed = routeUrlInWindow(first, normalized);
-      if (!routed) {
-        first.loadURL(normalized);
+      const sameTeam = targetTeam && windowTeam(target) === targetTeam;
+      const alreadyThere = sameTeam && normalized === target.__slackLastUrl;
+      if (!alreadyThere) {
+        const routed = routeUrlInWindow(target, normalized);
+        if (!routed) {
+          target.loadURL(normalized);
+        }
       }
-      if (first.isMinimized()) {
-        first.restore();
+      if (target.isMinimized()) {
+        target.restore();
       }
-      first.show();
-      first.focus();
-      return first;
+      target.show();
+      target.focus();
+      return target;
     } catch (err) {
       console.warn('Failed to route deep link to existing window', err);
     }
@@ -443,6 +464,32 @@ async function clearAppCache(targetWindow, options = {}) {
   }
 }
 
+// Signed-in workspaces, reported by the renderer from Slack's own local
+// config. Drives the Workspace menu (Cmd+1..9 switching, like the official app).
+let knownTeams = [];
+
+function cycleWorkspace(direction) {
+  if (knownTeams.length < 2) return;
+  const focused = BrowserWindow.getFocusedWindow();
+  const currentTeam = focused ? windowTeam(focused) : null;
+  const idx = Math.max(0, knownTeams.findIndex((t) => t.id === currentTeam));
+  const next = knownTeams[(idx + direction + knownTeams.length) % knownTeams.length];
+  if (next) focusOrCreateWindow(`https://app.slack.com/client/${next.id}`);
+}
+
+ipcMain.handle('slack-autocomplete:teams', (event, teams) => {
+  if (!isSlackSender(event)) throw new Error('teams rejected: untrusted sender');
+  const sanitized = (Array.isArray(teams) ? teams : [])
+    .filter((t) => t && /^T[A-Z0-9]+$/i.test(String(t.id || '')))
+    .slice(0, 20)
+    .map((t) => ({ id: String(t.id), name: typeof t.name === 'string' ? t.name.slice(0, 80) : String(t.id) }));
+  if (JSON.stringify(sanitized) !== JSON.stringify(knownTeams)) {
+    knownTeams = sanitized;
+    installApplicationMenu();
+  }
+  return { ok: true };
+});
+
 function installApplicationMenu() {
   if (!Menu || typeof Menu.buildFromTemplate !== 'function') {
     return;
@@ -492,6 +539,15 @@ function installApplicationMenu() {
             if (w) w.webContents.send('slack-autocomplete:export-channel');
           }
         },
+        {
+          label: 'Downloads',
+          accelerator: 'CmdOrCtrl+Shift+J',
+          click: (_item, focusedWindow) => {
+            const w = focusedWindow || BrowserWindow.getFocusedWindow();
+            if (w) w.webContents.send('slack-autocomplete:toggle-downloads');
+          }
+        },
+        { type: 'separator' },
         {
           label: 'Export Channel List',
           submenu: [
@@ -557,6 +613,34 @@ function installApplicationMenu() {
         { role: 'zoomout' },
         { type: 'separator' },
         { role: 'togglefullscreen' }
+      ]
+    },
+    {
+      label: 'Workspace',
+      submenu: [
+        ...knownTeams.map((team, idx) => ({
+          label: team.name || team.id,
+          accelerator: idx < 9 ? `CmdOrCtrl+${idx + 1}` : undefined,
+          click: () => focusOrCreateWindow(`https://app.slack.com/client/${team.id}`)
+        })),
+        ...(knownTeams.length ? [{ type: 'separator' }] : []),
+        {
+          label: 'Select Next Workspace',
+          accelerator: 'Ctrl+Tab',
+          enabled: knownTeams.length > 1,
+          click: () => cycleWorkspace(1)
+        },
+        {
+          label: 'Select Previous Workspace',
+          accelerator: 'Ctrl+Shift+Tab',
+          enabled: knownTeams.length > 1,
+          click: () => cycleWorkspace(-1)
+        },
+        { type: 'separator' },
+        {
+          label: 'Sign in to Another Workspace...',
+          click: () => focusOrCreateWindow('https://slack.com/signin')
+        }
       ]
     },
     // The standard window menu role is required for macOS to append its
@@ -830,18 +914,148 @@ function triggerDownload(url) {
   }
 }
 
+// --- Downloads tracking (backs the in-app downloads panel, like the official
+// app's downloads pane): every session download is tracked and progress is
+// broadcast to all Slack windows. ---
+const DOWNLOADS_HISTORY_LIMIT = 50;
+const downloadsHistory = [];   // newest first
+const activeDownloadItems = new Map(); // id -> DownloadItem
+
+function downloadSnapshot(entry) {
+  return {
+    id: entry.id,
+    filename: entry.filename,
+    path: entry.path,
+    state: entry.state,           // progressing | completed | cancelled | interrupted
+    receivedBytes: entry.receivedBytes,
+    totalBytes: entry.totalBytes,
+    startedAt: entry.startedAt
+  };
+}
+
+function broadcastDownloadEvent(entry) {
+  const payload = downloadSnapshot(entry);
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win && !win.isDestroyed()) {
+      try { win.webContents.send('slack-autocomplete:download-event', payload); } catch (err) { /* ignore */ }
+    }
+  }
+}
+
+let downloadCounter = 0;
+function installDownloadTracking(ses) {
+  ses.on('will-download', (_event, item) => {
+    const id = 'dl' + (++downloadCounter);
+    const entry = {
+      id,
+      filename: item.getFilename(),
+      path: '',
+      state: 'progressing',
+      receivedBytes: 0,
+      totalBytes: item.getTotalBytes(),
+      startedAt: Date.now()
+    };
+    downloadsHistory.unshift(entry);
+    if (downloadsHistory.length > DOWNLOADS_HISTORY_LIMIT) downloadsHistory.pop();
+    activeDownloadItems.set(id, item);
+    broadcastDownloadEvent(entry);
+
+    item.on('updated', () => {
+      entry.filename = item.getFilename();
+      entry.path = item.getSavePath();
+      entry.receivedBytes = item.getReceivedBytes();
+      entry.totalBytes = item.getTotalBytes();
+      entry.state = item.isPaused() ? 'progressing' : item.getState();
+      broadcastDownloadEvent(entry);
+    });
+    item.once('done', (_e, state) => {
+      entry.state = state; // completed | cancelled | interrupted
+      entry.path = item.getSavePath();
+      entry.receivedBytes = item.getReceivedBytes();
+      entry.totalBytes = item.getTotalBytes();
+      activeDownloadItems.delete(id);
+      broadcastDownloadEvent(entry);
+    });
+  });
+}
+
+function findDownloadEntry(id) {
+  return downloadsHistory.find((d) => d.id === id) || null;
+}
+
+ipcMain.handle('slack-autocomplete:downloads:list', (event) => {
+  if (!isSlackSender(event)) throw new Error('downloads rejected: untrusted sender');
+  return downloadsHistory.map(downloadSnapshot);
+});
+
+ipcMain.handle('slack-autocomplete:downloads:show-in-folder', (event, id) => {
+  if (!isSlackSender(event)) throw new Error('downloads rejected: untrusted sender');
+  const entry = findDownloadEntry(id);
+  if (entry && entry.path && entry.state === 'completed') shell.showItemInFolder(entry.path);
+  return { ok: true };
+});
+
+ipcMain.handle('slack-autocomplete:downloads:open', async (event, id) => {
+  if (!isSlackSender(event)) throw new Error('downloads rejected: untrusted sender');
+  const entry = findDownloadEntry(id);
+  if (entry && entry.path && entry.state === 'completed') {
+    const err = await shell.openPath(entry.path);
+    return { ok: !err, error: err || undefined };
+  }
+  return { ok: false };
+});
+
+ipcMain.handle('slack-autocomplete:downloads:cancel', (event, id) => {
+  if (!isSlackSender(event)) throw new Error('downloads rejected: untrusted sender');
+  const item = activeDownloadItems.get(id);
+  if (item) { try { item.cancel(); } catch (err) { /* ignore */ } }
+  return { ok: true };
+});
+
+ipcMain.handle('slack-autocomplete:downloads:clear', (event) => {
+  if (!isSlackSender(event)) throw new Error('downloads rejected: untrusted sender');
+  for (let i = downloadsHistory.length - 1; i >= 0; i--) {
+    if (downloadsHistory[i].state !== 'progressing') downloadsHistory.splice(i, 1);
+  }
+  return downloadsHistory.map(downloadSnapshot);
+});
+
+// Raw file URLs (files.slack.com / files-pri): the official app never renders
+// these in a window - they are downloads.
+function isSlackFileUrl(targetUrl) {
+  try {
+    const u = new URL(targetUrl);
+    if (!isSlackUrl(targetUrl)) return false;
+    return u.hostname === 'files.slack.com'
+      || u.hostname.startsWith('files.')
+      || u.pathname.startsWith('/files-pri/')
+      || u.pathname.startsWith('/files-tmb/');
+  } catch (err) {
+    return false;
+  }
+}
+
 function applyWindowPolicies(win) {
   win.webContents.session.setUserAgent(CHROME_UA);
   win.webContents.setWindowOpenHandler(({ url, disposition }) => {
     // Downloads that try to open a new window get routed to download manager instead of spawning a window.
-    if (disposition === 'save-to-disk') {
+    if (disposition === 'save-to-disk' || isSlackFileUrl(url)) {
       triggerDownload(url);
       return { action: 'deny' };
     }
 
     if (isSlackUrl(url)) {
-      focusOrCreateWindow(url);
-      return { action: 'deny' };
+      // Client routes go to the workspace's window. Everything else on
+      // slack.com (file viewers, canvases, auth popups) gets a real child
+      // window, matching the official app instead of hijacking the client.
+      if (isSlackAppNavigationUrl(url)) {
+        focusOrCreateWindow(url);
+        return { action: 'deny' };
+      }
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: buildWindowOptions()
+      };
     }
 
     // Non-Slack URLs: open in system browser, never inside the app.
@@ -849,7 +1063,19 @@ function applyWindowPolicies(win) {
     return { action: 'deny' };
   });
 
+  // Child windows opened with action:'allow' need the same policies.
+  win.webContents.on('did-create-window', (child) => {
+    try { applyWindowPolicies(child); } catch (err) { console.warn('Failed to apply policies to child window', err); }
+  });
+
   win.webContents.on('will-navigate', (event, url) => {
+    if (isSlackFileUrl(url)) {
+      // In-window clicks on raw file links become tracked downloads instead
+      // of replacing the Slack client with the file contents.
+      event.preventDefault();
+      triggerDownload(url);
+      return;
+    }
     if (!isSlackUrl(url)) {
       event.preventDefault();
       openExternalUrl(url);
@@ -1227,31 +1453,53 @@ ipcMain.handle('slack-autocomplete:open-external', async (_event, targetUrl) => 
   return { status: 'opened' };
 });
 
+// Permissions the Slack client legitimately needs. 'media' (microphone +
+// camera) and 'display-capture' make huddles and calls work like the
+// official app; the rest were already granted.
+const SLACK_ALLOWED_PERMISSIONS = new Set([
+  'idle-detection',
+  'notifications',
+  'media',
+  'audioCapture',
+  'videoCapture',
+  'display-capture',
+  'speaker-selection',
+  'fullscreen'
+]);
+
 function installPermissionHandlers(ses) {
   ses.setPermissionRequestHandler((wc, permission, callback) => {
     const url = wc.getURL();
-    if (url.includes('slack.com')) {
-      if (permission === 'idle-detection' || permission === 'notifications') {
-        return callback(true);
-      }
+    if (url.includes('slack.com') && SLACK_ALLOWED_PERMISSIONS.has(permission)) {
+      return callback(true);
     }
     callback(false);
   });
 
   ses.setPermissionCheckHandler((_wc, permission, requestingOrigin) => {
-    if (requestingOrigin.includes('slack.com')) {
-      if (permission === 'idle-detection' || permission === 'notifications') {
-        return true;
-      }
-    }
-    return false;
+    return requestingOrigin.includes('slack.com') && SLACK_ALLOWED_PERMISSIONS.has(permission);
   });
+
+  // Screen sharing for huddles: prefer the native macOS picker (same UX as the
+  // official app on Sonoma+); fall back to sharing the primary screen.
+  try {
+    ses.setDisplayMediaRequestHandler((request, callback) => {
+      desktopCapturer.getSources({ types: ['screen'] }).then((sources) => {
+        // No 'loopback' audio here: system-audio loopback is Windows-only.
+        if (sources && sources.length) callback({ video: sources[0] });
+        else callback({});
+      }).catch(() => callback({}));
+    }, { useSystemPicker: true });
+  } catch (err) {
+    console.warn('Failed to install display media handler', err);
+  }
 }
 
 app.whenReady().then(() => {
   // Global default UA (covers auth popups etc.).
   session.defaultSession.setUserAgent(CHROME_UA);
   installPermissionHandlers(session.defaultSession);
+  installDownloadTracking(session.defaultSession);
   registerProtocolHandler();
   installApplicationMenu();
 
@@ -3266,10 +3514,180 @@ cat > preload.js <<'EOF'
     setupAttachmentEscape();
     setupThreadWatcher();
     setupBadgeUpdater();
+    setupDownloadsPanel();
+    setupTeamsReporter();
     installNativeNotificationBridge();
     installIdleDetector();
     log('Slack autocomplete preload initialized.');
     exposeDebugHelpers();
+  }
+
+  // ===================== Downloads panel (official-style pane) =====================
+  function formatBytes(n) {
+    if (!isFinite(n) || n <= 0) return '';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let i = 0;
+    let v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)) + ' ' + units[i];
+  }
+
+  function setupDownloadsPanel() {
+    if (!ipcRenderer) return;
+    const items = new Map(); // id -> snapshot (insertion order = arrival order)
+    let root = null;
+    let listEl = null;
+    let visible = false;
+
+    function ensurePanel() {
+      if (root) return;
+      root = document.createElement('div');
+      root.id = 'slack-autocomplete-downloads-panel';
+      root.style.cssText = 'position:fixed;top:44px;right:8px;width:340px;max-height:70vh;z-index:2147483000;'
+        + 'background:#1d1c1d;color:#fff;border:1px solid #3a393a;border-radius:10px;'
+        + 'box-shadow:0 10px 40px rgba(0,0,0,0.5);display:none;flex-direction:column;'
+        + 'font-family:-apple-system,Segoe UI,sans-serif;overflow:hidden;';
+      const header = document.createElement('div');
+      header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid #3a393a;';
+      const title = document.createElement('div');
+      title.textContent = 'Downloads';
+      title.style.cssText = 'font-weight:700;font-size:14px;';
+      const headerBtns = document.createElement('div');
+      const clearBtn = document.createElement('button');
+      clearBtn.textContent = 'Clear';
+      clearBtn.style.cssText = 'background:none;border:0;color:#9a9a9a;cursor:pointer;font-size:12px;margin-right:8px;';
+      clearBtn.addEventListener('click', async () => {
+        try {
+          const remaining = await ipcRenderer.invoke('slack-autocomplete:downloads:clear');
+          items.clear();
+          for (const it of (remaining || [])) items.set(it.id, it);
+          render();
+        } catch (err) { log('downloads clear failed', err); }
+      });
+      const closeBtn = document.createElement('button');
+      closeBtn.textContent = '✕';
+      closeBtn.style.cssText = 'background:none;border:0;color:#9a9a9a;cursor:pointer;font-size:13px;';
+      closeBtn.addEventListener('click', () => setVisible(false));
+      headerBtns.appendChild(clearBtn);
+      headerBtns.appendChild(closeBtn);
+      header.appendChild(title);
+      header.appendChild(headerBtns);
+      listEl = document.createElement('div');
+      listEl.style.cssText = 'overflow-y:auto;padding:6px 0;';
+      root.appendChild(header);
+      root.appendChild(listEl);
+      document.body.appendChild(root);
+    }
+
+    function actionButton(label, handler) {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.style.cssText = 'background:#2c2d30;border:1px solid #4a4a4a;border-radius:5px;color:#d1d2d3;'
+        + 'cursor:pointer;font-size:11px;padding:3px 8px;margin-right:6px;';
+      b.addEventListener('click', handler);
+      return b;
+    }
+
+    function render() {
+      ensurePanel();
+      listEl.textContent = '';
+      const all = Array.from(items.values());
+      if (!all.length) {
+        const empty = document.createElement('div');
+        empty.textContent = 'No downloads yet';
+        empty.style.cssText = 'padding:18px 12px;color:#9a9a9a;font-size:13px;text-align:center;';
+        listEl.appendChild(empty);
+        return;
+      }
+      for (const it of all) {
+        const row = document.createElement('div');
+        row.style.cssText = 'padding:8px 12px;border-bottom:1px solid #2a292a;';
+        const name = document.createElement('div');
+        name.textContent = it.filename || '(file)';
+        name.style.cssText = 'font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+        row.appendChild(name);
+        const status = document.createElement('div');
+        status.style.cssText = 'font-size:11px;color:#9a9a9a;margin:3px 0 5px;';
+        if (it.state === 'progressing') {
+          const pct = it.totalBytes > 0 ? Math.round((it.receivedBytes / it.totalBytes) * 100) : null;
+          status.textContent = formatBytes(it.receivedBytes)
+            + (it.totalBytes > 0 ? ' of ' + formatBytes(it.totalBytes) + ' (' + pct + '%)' : '');
+          const barWrap = document.createElement('div');
+          barWrap.style.cssText = 'height:4px;background:#3a393a;border-radius:2px;overflow:hidden;margin-bottom:6px;';
+          const bar = document.createElement('div');
+          bar.style.cssText = 'height:100%;background:#36c5f0;width:' + (pct === null ? 30 : pct) + '%;';
+          barWrap.appendChild(bar);
+          row.appendChild(status);
+          row.appendChild(barWrap);
+          row.appendChild(actionButton('Cancel', () => {
+            ipcRenderer.invoke('slack-autocomplete:downloads:cancel', it.id).catch(() => {});
+          }));
+        } else if (it.state === 'completed') {
+          status.textContent = formatBytes(it.totalBytes || it.receivedBytes) + ' - completed';
+          row.appendChild(status);
+          row.appendChild(actionButton('Open', () => {
+            ipcRenderer.invoke('slack-autocomplete:downloads:open', it.id).catch(() => {});
+          }));
+          row.appendChild(actionButton('Show in Finder', () => {
+            ipcRenderer.invoke('slack-autocomplete:downloads:show-in-folder', it.id).catch(() => {});
+          }));
+        } else {
+          status.textContent = it.state; // cancelled | interrupted
+          status.style.color = '#e01e5a';
+          row.appendChild(status);
+        }
+        listEl.appendChild(row);
+      }
+    }
+
+    function setVisible(v) {
+      ensurePanel();
+      visible = v;
+      root.style.display = v ? 'flex' : 'none';
+      if (v) render();
+    }
+
+    async function refreshFromMain() {
+      try {
+        const list = await ipcRenderer.invoke('slack-autocomplete:downloads:list');
+        items.clear();
+        for (const it of (list || [])) items.set(it.id, it);
+      } catch (err) { log('downloads list failed', err); }
+    }
+
+    ipcRenderer.on('slack-autocomplete:download-event', (_event, snapshot) => {
+      if (!snapshot || !snapshot.id) return;
+      const isNew = !items.has(snapshot.id);
+      items.set(snapshot.id, snapshot);
+      if (isNew && snapshot.state === 'progressing') setVisible(true); // surface new downloads
+      if (visible) render();
+    });
+
+    ipcRenderer.on('slack-autocomplete:toggle-downloads', async () => {
+      if (!visible) await refreshFromMain();
+      setVisible(!visible);
+    });
+
+    refreshFromMain();
+  }
+  // =================== end downloads panel ===================
+
+  // Report signed-in workspaces to the main process so the Workspace menu
+  // (Cmd+1..9 switching) stays in sync with Slack's own local config.
+  function setupTeamsReporter() {
+    if (!ipcRenderer) return;
+    const report = () => {
+      try {
+        const raw = window.localStorage.getItem('localConfig_v2');
+        const cfg = JSON.parse(raw);
+        const teams = Object.values((cfg && cfg.teams) || {})
+          .filter((t) => t && t.id)
+          .map((t) => ({ id: t.id, name: t.name }));
+        if (teams.length) ipcRenderer.invoke('slack-autocomplete:teams', teams).catch(() => {});
+      } catch (err) { /* ignore */ }
+    };
+    report();
+    setInterval(report, 60000);
   }
 
   // ===================== Channel JSON export (web API) =====================
@@ -3577,6 +3995,21 @@ if [[ -f "$APP_ICON" ]]; then
   ICON_ARGS+=("--icon=$APP_ICON")
 fi
 
+# TCC usage descriptions: without these macOS terminates the app the moment
+# a huddle asks for the microphone or camera.
+cat > "$APP_DIR/extend-info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Microphone access is used for Slack huddles and calls.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Camera access is used for Slack huddles and calls.</string>
+</dict>
+</plist>
+PLIST
+
 echo "Packaging macOS app with electron-packager..."
 npx electron-packager . "$APP_NAME" \
   --platform=darwin \
@@ -3586,6 +4019,7 @@ npx electron-packager . "$APP_NAME" \
   --app-bundle-id="$BUNDLE_ID" \
   --protocol=slack \
   --protocol-name="Slack URL" \
+  --extend-info="$APP_DIR/extend-info.plist" \
   "${ICON_ARGS[@]}" > /dev/null
 
 APP_PATH="$APP_DIR/dist/${APP_NAME}-darwin-${EP_ARCH}/${APP_NAME}.app"
