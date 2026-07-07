@@ -3885,8 +3885,10 @@ cat > preload.js <<'EOF'
     style.textContent = [
       '[data-saw-popout-hidden] { display: none !important; }',
       '[data-saw-popout-pane] {',
-      '  position: fixed !important; inset: 0 !important;',
-      '  width: 100vw !important; height: 100vh !important;',
+      '  position: fixed !important;',
+      '  top: var(--saw-titlebar-h, 0px) !important; left: 0 !important;',
+      '  right: 0 !important; bottom: 0 !important;',
+      '  width: 100vw !important; height: auto !important;',
       '  max-width: none !important; background: #1a1d21 !important;',
       '}'
     ].join('\n');
@@ -3919,9 +3921,8 @@ cat > preload.js <<'EOF'
   }
 
   // Pop-out chrome polish (official-app parity): no back chevron / close-pane
-  // X in thread windows, and room for the traffic lights (hiddenInset title
-  // bar) in the pane header, which doubles as the window drag area.
-  function installPopoutChromeStyle(rootClass, headerSelector) {
+  // X in thread windows.
+  function installPopoutChromeStyle(rootClass) {
     const style = document.createElement('style');
     style.textContent = [
       // In the pop-out's narrow layout the close control renders as a "<"
@@ -3929,16 +3930,71 @@ cat > preload.js <<'EOF'
       `html.${rootClass} [data-qa="close_flexpane"],`,
       `html.${rootClass} [data-qa="flexpane_back"],`,
       `html.${rootClass} .p-flexpane_header button[aria-label="Close"],`,
-      `html.${rootClass} .p-flexpane_header button[aria-label="Back"] { display: none !important; }`,
-      IS_MAC_PRELOAD ? `html.${rootClass} ${headerSelector} { padding-left: 72px !important; -webkit-app-region: drag; }` : '',
-      IS_MAC_PRELOAD ? `html.${rootClass} ${headerSelector} button, html.${rootClass} ${headerSelector} a, html.${rootClass} ${headerSelector} [role="button"] { -webkit-app-region: no-drag; }` : ''
+      `html.${rootClass} .p-flexpane_header button[aria-label="Back"] { display: none !important; }`
     ].join('\n');
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  // Official-style pop-out title bar: a dedicated strip at the top holding
+  // the traffic lights, back/forward buttons and the window title, acting as
+  // the drag region (the official shell draws exactly this - titleBarStyle
+  // hidden with a 31px overlay strip; see its window.name config).
+  const POPOUT_TITLEBAR_H = 38;
+  function installPopoutTitleBar(kind) {
+    document.documentElement.style.setProperty('--saw-titlebar-h', POPOUT_TITLEBAR_H + 'px');
+    const bar = document.createElement('div');
+    bar.id = 'slack-autocomplete-popout-titlebar';
+    bar.style.cssText = 'position:fixed;top:0;left:0;right:0;height:' + POPOUT_TITLEBAR_H + 'px;'
+      + 'z-index:2147483200;-webkit-app-region:drag;display:flex;align-items:center;'
+      + 'justify-content:center;color:#d1d2d3;font-size:13px;font-weight:600;'
+      + 'background:#1a1d21;font-family:-apple-system,Segoe UI,sans-serif;';
+    const titleEl = document.createElement('span');
+    titleEl.style.cssText = 'max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+    bar.appendChild(titleEl);
+    const nav = document.createElement('div');
+    nav.style.cssText = 'position:absolute;left:' + (IS_MAC_PRELOAD ? 84 : 8) + 'px;top:0;bottom:0;'
+      + 'display:flex;align-items:center;gap:2px;-webkit-app-region:no-drag;';
+    const mkNav = (glyph, fn) => {
+      const b = document.createElement('button');
+      b.textContent = glyph;
+      b.style.cssText = 'background:none;border:0;color:#9a9a9a;font-size:16px;cursor:pointer;padding:2px 8px;';
+      b.addEventListener('click', fn);
+      return b;
+    };
+    nav.appendChild(mkNav('←', () => window.history.back()));
+    nav.appendChild(mkNav('→', () => window.history.forward()));
+    bar.appendChild(nav);
+    const attach = () => { (document.body || document.documentElement).appendChild(bar); };
+    if (document.body) attach();
+    else window.addEventListener('DOMContentLoaded', attach, { once: true });
+
+    const sync = () => {
+      let t = String(document.title || '');
+      const isThreadTitle = /\(Thread\)/.test(t);
+      const isChannelTitle = /\(Channel\)/.test(t);
+      t = t.replace(/\s*\((Thread|Channel|DM)\).*$/, '').replace(/\s*-\s*Slack\s*$/, '');
+      if (kind === 'thread' || isThreadTitle) t = 'Thread in ' + t;
+      else if (isChannelTitle) t = '#' + t;
+      titleEl.textContent = t;
+      try {
+        const bg = getComputedStyle(document.body).backgroundColor;
+        if (bg && bg !== 'rgba(0, 0, 0, 0)') bar.style.background = bg;
+      } catch (err) { /* keep fallback */ }
+    };
+    sync();
+    setInterval(sync, 1000);
+
+    // Push the client content below the strip.
+    const style = document.createElement('style');
+    style.textContent = '.p-client_container { position: fixed !important; top: var(--saw-titlebar-h) !important;'
+      + ' left: 0 !important; right: 0 !important; bottom: 0 !important; height: auto !important; }';
     (document.head || document.documentElement).appendChild(style);
   }
 
   function applyThreadPopoutMode() {
     document.documentElement.classList.add('saw-thread-popout');
-    installPopoutChromeStyle('saw-thread-popout', '.p-flexpane_header');
+    installPopoutChromeStyle('saw-thread-popout');
+    installPopoutTitleBar('thread');
     installPopoutCover();
     // The window boots on the channel route; once the client shell is up we
     // navigate to the thread URL (full reload - the preload re-runs and this
@@ -3975,7 +4031,8 @@ cat > preload.js <<'EOF'
   //     focus wrappers (display:contents) are left alone.
   function applyChannelPopoutMode() {
     document.documentElement.classList.add('saw-channel-popout');
-    installPopoutChromeStyle('saw-channel-popout', '.p-view_header, [data-qa="channel_header"]');
+    installPopoutChromeStyle('saw-channel-popout');
+    installPopoutTitleBar('channel');
     const style = document.createElement('style');
     style.id = 'slack-autocomplete-channel-popout';
     style.textContent = [
@@ -3985,6 +4042,10 @@ cat > preload.js <<'EOF'
       'html.saw-channel-popout .p-view_contents--sidebar,',
       'html.saw-channel-popout [data-qa="channel_sidebar"],',
       'html.saw-channel-popout .p-control_strip,',
+      // The hidden sidebar's resizer handle stays interactive otherwise (a
+      // draggable blue divider floating mid-window).
+      'html.saw-channel-popout .p-resizer,',
+      'html.saw-channel-popout .p-resizer__input,',
       'html.saw-channel-popout .p-ia4_top_nav { display: none !important; }',
       'html.saw-channel-popout .p-client_workspace_wrapper { grid-template-columns: 0 1fr !important; }',
       'html.saw-channel-popout .p-client_workspace__tabpanel:has(.p-view_contents--sidebar) { grid-template-columns: 0 1fr !important; }'
