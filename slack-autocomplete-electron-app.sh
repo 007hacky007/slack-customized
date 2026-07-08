@@ -4818,6 +4818,8 @@ cat > preload.js <<'EOF'
     const log = (msg) => { try { console.log('[slack-sections]', msg); } catch (e) {} overlay.appendLog(msg); };
     const ac = new AbortController();
     overlay.onCancel(() => { log('cancel requested'); ac.abort(); });
+    // Once true, a cancel may leave changes applied; stays false during the read-only phase.
+    let mutationStarted = false;
     try {
       const picked = await ipcRenderer.invoke('slack-autocomplete:open-import');
       if (picked && picked.canceled) { overlay.destroy(); return; }
@@ -4855,6 +4857,7 @@ cat > preload.js <<'EOF'
       const ok = await overlay.confirm('Create ' + plan.counts.create + ' sections, move '
         + plan.counts.move + ' channels, skip ' + plan.counts.skip + '. Apply?');
       if (!ok) { log('canceled at confirmation'); overlay.done('Import canceled. Nothing was changed.'); return; }
+      mutationStarted = true;
 
       // Execute: create sections first so moves have a target id.
       const idByName = new Map();
@@ -4903,7 +4906,7 @@ cat > preload.js <<'EOF'
       if (failed) overlay.fail(summary); else overlay.done(summary);
     } catch (e) {
       log('FAILED: ' + ((e && e.message) || e));
-      if (e && e.name === 'AbortError') overlay.done('Import canceled. Changes applied before canceling remain.');
+      if (e && e.name === 'AbortError') overlay.done(mutationStarted ? 'Import canceled. Changes applied before canceling remain.' : 'Import canceled. Nothing was changed.');
       else overlay.fail(String((e && e.message) || e));
     } finally {
       exportInProgress = false;
