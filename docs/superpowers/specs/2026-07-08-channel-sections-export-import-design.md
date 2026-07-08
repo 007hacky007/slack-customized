@@ -40,6 +40,56 @@ endpoints sync to all of the user's Slack clients, exactly as if done in the off
   "version": 1,
   "exportedAt": "2026-07-08T12:00:00.000Z",
   "workspace": { "id": "T123", "name": "acme" },
+  "instructions": [
+    "This file maps Slack sidebar sections to channels. To reorganize, move channel objects between the 'channels' arrays of sections, or from 'unsectioned' into a section.",
+    "To create a new section, add an object to 'sections' with a 'name', an optional 'emoji' (emoji name without colons), and a 'channels' array.",
+    "Channels are matched by 'id' on import; 'name' is informational only. Do not invent channel ids.",
+    "Import is additive: it creates missing sections and moves the listed channels into them. It never deletes sections or removes channels from sections. Channels left in 'unsectioned' are ignored on import.",
+    "Each channel id should appear at most once across all sections; if it appears more than once, the first placement wins.",
+    "Do not modify 'format', 'version', 'workspace', or 'schema'."
+  ],
+  "schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "required": ["format", "version", "workspace", "sections"],
+    "properties": {
+      "format": { "const": "slack-sections-export" },
+      "version": { "type": "integer" },
+      "exportedAt": { "type": "string" },
+      "workspace": {
+        "type": "object",
+        "required": ["id"],
+        "properties": { "id": { "type": "string" }, "name": { "type": "string" } }
+      },
+      "instructions": { "type": "array", "items": { "type": "string" } },
+      "sections": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["name", "channels"],
+          "properties": {
+            "name": { "type": "string", "minLength": 1 },
+            "emoji": { "type": ["string", "null"] },
+            "channels": { "$ref": "#/definitions/channelList" }
+          }
+        }
+      },
+      "unsectioned": { "$ref": "#/definitions/channelList" }
+    },
+    "definitions": {
+      "channelList": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["id"],
+          "properties": {
+            "id": { "type": "string", "pattern": "^[CDG][A-Z0-9]+$" },
+            "name": { "type": "string" }
+          }
+        }
+      }
+    }
+  },
   "sections": [
     {
       "name": "Infra",
@@ -56,6 +106,12 @@ endpoints sync to all of the user's Slack clients, exactly as if done in the off
 }
 ```
 
+The `instructions` and `schema` fields exist so that a human or an LLM editing the file
+has the format contract and the editing rules inline, with no external reference needed.
+Import ignores both fields entirely (they are not used for validation; import has its own
+built-in validation matching the same rules), so a file with them stripped or stale still
+imports fine.
+
 - `sections` contains only user-created sections (Slack `type: "standard"`). System
   sections (Starred, default Channels, DMs) are excluded from export and are never an
   import target.
@@ -64,7 +120,11 @@ endpoints sync to all of the user's Slack clients, exactly as if done in the off
   a channel from a section).
 - `emoji` is the section's emoji name without colons, or absent/null when the section has
   none.
-- `format`/`version` allow import to reject files that are not a sections export.
+- `format`/`version` gate the import: `format` must equal `slack-sections-export`, and
+  `version` must be an integer less than or equal to the app's supported version (currently
+  1). A higher version fails with "this file was created by a newer version of the app".
+  This lets future format changes bump the version and keep older files importable
+  (versions below the current one are upgraded/accepted per-version as the format evolves).
 
 ## Menu (main process)
 
@@ -103,8 +163,10 @@ channels", "Saving file".
    `{ canceled }` or `{ path, content }`. Sender-validated with the existing
    `isSlackSender` check, like every other handler.
 2. **Validate:** `exportCore.parseSectionsDoc(content)` (new pure function) - checks
-   `format`/`version`, shape of `sections`/`channels`, returns the parsed doc or a
-   descriptive error. A workspace-ID mismatch between the file and the current workspace is
+   `format` (must be `slack-sections-export`), `version` (integer, <= supported version;
+   higher fails with a "newer app version" message), shape of `sections`/`channels`, and
+   returns the parsed doc or a descriptive error. The embedded `instructions`/`schema`
+   fields are ignored. A workspace-ID mismatch between the file and the current workspace is
    a hard error (this feature is same-workspace by design; channel IDs would not match
    anyway).
 3. **Fetch current state:** `users.channelSections.list` + `fetchAllMemberChannels` (same
