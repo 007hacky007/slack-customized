@@ -4732,6 +4732,66 @@ cat > preload.js <<'EOF'
       exportInProgress = false;
     }
   });
+  // ===================== Channel sections export (web API) =====================
+  ipcRenderer.on('slack-autocomplete:export-sections', async () => {
+    if (exportInProgress) return;
+    exportInProgress = true;
+    const overlay = createExportOverlay('Exporting channel sections...');
+    const log = (msg) => { try { console.log('[slack-sections]', msg); } catch (e) {} overlay.appendLog(msg); };
+    const ac = new AbortController();
+    overlay.onCancel(() => { log('cancel requested'); ac.abort(); });
+    let saveToken = null;
+    try {
+      log('starting sections export');
+      const cfg = getExportConfig(log, { requireChannel: false });
+      const apiCall = createApiCall(cfg, ac.signal, log);
+      const workspace = exportCore.workspaceFromConfig(cfg.localConfigRaw, cfg.teamId);
+
+      overlay.setPhase('Fetching sections...');
+      const listResp = await apiCall('users.channelSections.list', {});
+      const sections = exportCore.normalizeSections(listResp);
+      log('sections: ' + sections.filter((s) => s.type === 'standard').length
+        + ' custom of ' + sections.length + ' total');
+
+      const channels = await exportCore.fetchAllMemberChannels(apiCall,
+        { types: 'public_channel,private_channel' }, {
+          signal: ac.signal,
+          onProgress: (p, cur, total) => {
+            overlay.setProgress(phaseLabel(p), cur, total);
+            log(phaseLabel(p) + ': ' + cur + ' so far');
+          },
+        });
+      log('fetched ' + channels.length + ' member channels');
+
+      const doc = exportCore.buildSectionsDoc(sections, channels, {
+        exportedAt: new Date().toISOString(), teamId: cfg.teamId, workspace,
+      });
+      log('doc: ' + doc.sections.length + ' sections, ' + doc.unsectioned.length + ' unsectioned');
+
+      const suggested = 'slack-sections-' + (workspace.name || cfg.teamId) + '-' + exportTsStamp() + '.json';
+      log('choosing save destination...');
+      const begin = await ipcRenderer.invoke('slack-autocomplete:save-export:begin', { suggestedName: suggested });
+      if (begin && begin.canceled) { log('save dialog canceled'); overlay.destroy(); return; }
+      saveToken = begin.token;
+
+      overlay.setPhase('Saving file...');
+      await ipcRenderer.invoke('slack-autocomplete:save-export:write', {
+        token: saveToken, chunk: JSON.stringify(doc, null, 2) + '\n',
+      });
+      const res = await ipcRenderer.invoke('slack-autocomplete:save-export:commit', { token: saveToken });
+      log('saved: ' + res.path);
+      overlay.done('Saved ' + doc.sections.length + ' sections ('
+        + doc.unsectioned.length + ' unsectioned channels) to ' + res.path);
+    } catch (e) {
+      log('FAILED: ' + ((e && e.message) || e));
+      if (saveToken) { try { await ipcRenderer.invoke('slack-autocomplete:save-export:abort', { token: saveToken }); } catch (e2) { /* ignore */ } }
+      if (e && e.name === 'AbortError') overlay.done('Export canceled.');
+      else overlay.fail(String((e && e.message) || e));
+    } finally {
+      exportInProgress = false;
+    }
+  });
+  // =================== end channel sections export ===================
   // =================== end channel list export ===================
 
   if (document.readyState === 'loading') {
