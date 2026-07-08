@@ -638,6 +638,25 @@ function installApplicationMenu() {
             }
           ]
         },
+        {
+          label: 'Channel Sections',
+          submenu: [
+            {
+              label: 'Export Sections...',
+              click: (_item, focusedWindow) => {
+                const w = focusedWindow || BrowserWindow.getFocusedWindow();
+                if (w) w.webContents.send('slack-autocomplete:export-sections');
+              }
+            },
+            {
+              label: 'Import Sections...',
+              click: (_item, focusedWindow) => {
+                const w = focusedWindow || BrowserWindow.getFocusedWindow();
+                if (w) w.webContents.send('slack-autocomplete:import-sections');
+              }
+            }
+          ]
+        },
         { type: 'separator' },
         IS_MAC ? { role: 'close' } : { role: 'quit' }
       ]
@@ -1656,6 +1675,24 @@ ipcMain.handle('slack-autocomplete:save-export:abort', async (event, payload = {
   try { await fs.promises.unlink(s.tmpPath); } catch (e) { /* ignore */ }
   exportSaveSessions.delete(payload.token);
   return { ok: true };
+});
+
+// Sections import: file-open dialog + size-capped read, all in the main
+// process so the renderer never touches the filesystem.
+ipcMain.handle('slack-autocomplete:open-import', async (event) => {
+  if (!isSlackSender(event)) throw new Error('import rejected: untrusted sender');
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const res = await dialog.showOpenDialog(win, {
+    defaultPath: app.getPath('downloads'),
+    filters: [{ name: 'JSON', extensions: ['json'] }],
+    properties: ['openFile']
+  });
+  if (res.canceled || !res.filePaths || !res.filePaths[0]) return { canceled: true };
+  const filePath = res.filePaths[0];
+  const st = await fs.promises.stat(filePath);
+  if (st.size > 5 * 1024 * 1024) throw new Error('File too large (max 5 MB).');
+  const content = await fs.promises.readFile(filePath, 'utf8');
+  return { ok: true, path: filePath, content };
 });
 
 ipcMain.handle('slack-autocomplete:open-external', async (_event, targetUrl) => {
