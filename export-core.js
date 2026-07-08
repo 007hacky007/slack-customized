@@ -379,6 +379,31 @@ function formatChannelListText(channels) {
   return (channels || []).map((c) => '#' + (c.name || c.id)).join('\n') + ((channels || []).length ? '\n' : '');
 }
 
+// ===================== Channel sections export/import =====================
+
+// Normalizes a users.channelSections.list response into plain section objects.
+// Live-verified: the API returns emoji WITHOUT wrapping colons already ("" for
+// none, "wrench", skin tones as "older_man::skin-tone-6"). Strip only wrapping
+// colons (defensive, e.g. ":wrench:" -> "wrench") so the interior "::" of a
+// skin-tone emoji survives; empty -> null.
+function normalizeSections(resp) {
+  if (!resp || resp.ok === false) {
+    throw new Error('users.channelSections.list failed: ' + (resp && resp.error));
+  }
+  const raw = Array.isArray(resp.channel_sections) ? resp.channel_sections : [];
+  return raw
+    .map((s) => ({
+      id: (s && (s.channel_section_id || s.id)) || null,
+      name: (s && typeof s.name === 'string') ? s.name : '',
+      emoji: (s && typeof s.emoji === 'string' && s.emoji.replace(/^:+|:+$/g, '')) || null,
+      type: (s && s.type) || 'standard',
+      channelIds: (s && s.channel_ids_page && Array.isArray(s.channel_ids_page.channel_ids))
+        ? s.channel_ids_page.channel_ids.slice()
+        : ((s && Array.isArray(s.channel_ids)) ? s.channel_ids.slice() : []),
+    }))
+    .filter((s) => s.id);
+}
+
 async function fetchThreadReplies(apiCall, opts, hooks) {
   hooks = hooks || {};
   const channel = opts.channel;
@@ -536,5 +561,5 @@ module.exports = {
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
   TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory, fetchThreadReplies,
-  backfillReactions, resolveActors, runExport,
+  backfillReactions, resolveActors, runExport, normalizeSections,
 };

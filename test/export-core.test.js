@@ -510,3 +510,37 @@ test('summarizeCounts reports the non-muted unread conversation ids', () => {
   assert.deepEqual(s2.unreadIds, []);
   assert.equal(s2.threadsUnread, false);
 });
+
+test('normalizeSections maps list response, strips only wrapping emoji colons', () => {
+  // Live-verified: list returns emoji WITHOUT wrapping colons ('' for none),
+  // and skin-tone emoji keep an interior '::' that must survive normalization.
+  const resp = { ok: true, channel_sections: [
+    { channel_section_id: 'S1', name: 'Infra', emoji: ':wrench:', type: 'standard',
+      channel_ids_page: { channel_ids: ['C1', 'C2'], count: 2, cursor: 'C2' } },
+    { channel_section_id: 'S2', name: 'Starred', emoji: '', type: 'stars',
+      channel_ids_page: { channel_ids: [], count: 0 } },
+    { channel_section_id: 'S3', name: 'People', emoji: 'older_man::skin-tone-6', type: 'standard',
+      channel_ids_page: { channel_ids: ['C3'], count: 1, cursor: 'C3' } },
+  ]};
+  assert.deepEqual(core.normalizeSections(resp), [
+    { id: 'S1', name: 'Infra', emoji: 'wrench', type: 'standard', channelIds: ['C1', 'C2'] },
+    { id: 'S2', name: 'Starred', emoji: null, type: 'stars', channelIds: [] },
+    { id: 'S3', name: 'People', emoji: 'older_man::skin-tone-6', type: 'standard', channelIds: ['C3'] },
+  ]);
+});
+
+test('normalizeSections tolerates missing pieces and drops id-less entries', () => {
+  const resp = { ok: true, channel_sections: [
+    { channel_section_id: 'S1', type: 'standard' },
+    { name: 'ghost', type: 'standard' },
+  ]};
+  assert.deepEqual(core.normalizeSections(resp), [
+    { id: 'S1', name: '', emoji: null, type: 'standard', channelIds: [] },
+  ]);
+  assert.deepEqual(core.normalizeSections({ ok: true }), []);
+});
+
+test('normalizeSections throws on error responses', () => {
+  assert.throws(() => core.normalizeSections({ ok: false, error: 'invalid_auth' }), /invalid_auth/);
+  assert.throws(() => core.normalizeSections(null), /users\.channelSections\.list failed/);
+});
