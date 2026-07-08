@@ -954,7 +954,7 @@ After the export-sections listener from Task 7 (before its `// =================
   ipcRenderer.on('slack-autocomplete:import-sections', async () => {
     if (exportInProgress) return;
     exportInProgress = true;
-    const overlay = createExportOverlay('Importing channel sections...');
+    const overlay = createExportOverlay('Importing channel sections...', { noun: 'Import' });
     const log = (msg) => { try { console.log('[slack-sections]', msg); } catch (e) {} overlay.appendLog(msg); };
     const ac = new AbortController();
     overlay.onCancel(() => { log('cancel requested'); ac.abort(); });
@@ -999,6 +999,9 @@ After the export-sections listener from Task 7 (before its `// =================
       if (!ok) { log('canceled at confirmation'); overlay.done('Import canceled. Nothing was changed.'); return; }
       mutationStarted = true;
 
+      // The plan above was computed from a pre-confirmation snapshot: sidebar
+      // changes made by the user (or another client) while the dialog was open
+      // are not re-checked, so an individual remove can become a stale no-op.
       // Execute: create sections first so moves have a target id.
       const idByName = new Map();
       let created = 0, moved = 0, failed = 0;
@@ -1012,6 +1015,10 @@ After the export-sections listener from Task 7 (before its `// =================
         // param entirely when the section has no emoji ('' is unverified).
         const params = { name: s.name };
         if (s.emoji) params.emoji = s.emoji;
+        // createApiCall retries 5xx/transport errors, and create is not
+        // idempotent: if the request actually succeeded but the success
+        // response was lost, the retry creates a duplicate section. Accepted
+        // risk - import is additive-only, so this cannot lose data.
         const r = await apiCall('users.channelSections.create', params);
         if (!r || r.ok === false || !r.channel_section_id) {
           failed++; log('create "' + s.name + '" FAILED: ' + ((r && r.error) || 'no id returned'));

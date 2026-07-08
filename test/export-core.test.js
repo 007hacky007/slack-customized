@@ -741,3 +741,18 @@ test('computeSectionsImportPlan: channel only known from a section (e.g. a DM) i
   // C3 sits only in the starred (non-standard) section: insert without removing from Starred
   assert.deepEqual(plan.moves[0].removeGroups, [{ sectionId: 'S3', channelIds: ['D7'] }]);
 });
+
+test('computeSectionsImportPlan: current section name with surrounding whitespace still matches the file\'s trimmed name', () => {
+  const current = [
+    { id: 'S1', name: ' Infra ', emoji: null, type: 'standard', channelIds: ['C1'] },
+  ];
+  const members = [{ id: 'C1', name: 'backbone' }];
+  const doc = { sections: [
+    { name: 'Infra', emoji: null, channels: [{ id: 'C1' }] },
+  ]};
+  const plan = core.computeSectionsImportPlan(doc, current, members);
+  assert.deepEqual(plan.create, []);
+  assert.deepEqual(plan.moves, []);
+  assert.equal(plan.skips.length, 1);
+  assert.match(plan.skips[0].reason, /already in/);
+});

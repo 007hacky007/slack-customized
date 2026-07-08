@@ -4543,7 +4543,9 @@ cat > preload.js <<'EOF'
     };
   }
 
-  function createExportOverlay(titleText) {
+  function createExportOverlay(titleText, opts) {
+    opts = opts || {};
+    const noun = opts.noun || 'Export';
     const root = document.createElement('div');
     root.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;font-family:-apple-system,Segoe UI,sans-serif;';
     const box = document.createElement('div');
@@ -4607,8 +4609,8 @@ cat > preload.js <<'EOF'
           cancelCb = () => { applyBtn.remove(); resolve(false); if (prevCancel) prevCancel(); };
         });
       },
-      done(text) { title.textContent = 'Export complete'; phase.textContent = text; barDeterminate(100); cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); },
-      fail(text) { title.textContent = 'Export failed'; phase.textContent = text; barDeterminate(100); bar.style.background = '#e01e5a'; cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); },
+      done(text) { title.textContent = noun + ' complete'; phase.textContent = text; barDeterminate(100); cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); },
+      fail(text) { title.textContent = noun + ' failed'; phase.textContent = text; barDeterminate(100); bar.style.background = '#e01e5a'; cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); },
       destroy() { if (root.parentNode) root.remove(); },
     };
   }
@@ -4814,7 +4816,7 @@ cat > preload.js <<'EOF'
   ipcRenderer.on('slack-autocomplete:import-sections', async () => {
     if (exportInProgress) return;
     exportInProgress = true;
-    const overlay = createExportOverlay('Importing channel sections...');
+    const overlay = createExportOverlay('Importing channel sections...', { noun: 'Import' });
     const log = (msg) => { try { console.log('[slack-sections]', msg); } catch (e) {} overlay.appendLog(msg); };
     const ac = new AbortController();
     overlay.onCancel(() => { log('cancel requested'); ac.abort(); });
@@ -4859,6 +4861,9 @@ cat > preload.js <<'EOF'
       if (!ok) { log('canceled at confirmation'); overlay.done('Import canceled. Nothing was changed.'); return; }
       mutationStarted = true;
 
+      // The plan above was computed from a pre-confirmation snapshot: sidebar
+      // changes made by the user (or another client) while the dialog was open
+      // are not re-checked, so an individual remove can become a stale no-op.
       // Execute: create sections first so moves have a target id.
       const idByName = new Map();
       let created = 0, moved = 0, failed = 0;
@@ -4872,6 +4877,10 @@ cat > preload.js <<'EOF'
         // param entirely when the section has no emoji ('' is unverified).
         const params = { name: s.name };
         if (s.emoji) params.emoji = s.emoji;
+        // createApiCall retries 5xx/transport errors, and create is not
+        // idempotent: if the request actually succeeded but the success
+        // response was lost, the retry creates a duplicate section. Accepted
+        // risk - import is additive-only, so this cannot lose data.
         const r = await apiCall('users.channelSections.create', params);
         if (!r || r.ok === false || !r.channel_section_id) {
           failed++; log('create "' + s.name + '" FAILED: ' + ((r && r.error) || 'no id returned'));

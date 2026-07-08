@@ -562,7 +562,8 @@ function computeSectionsImportPlan(doc, currentSections, memberChannels) {
   const standard = (currentSections || []).filter((s) => s.type === 'standard');
   const sectionIdByName = new Map();
   for (const s of standard) {
-    if (!sectionIdByName.has(s.name)) sectionIdByName.set(s.name, s.id);
+    const trimmedName = s.name.trim();
+    if (!sectionIdByName.has(trimmedName)) sectionIdByName.set(trimmedName, s.id);
   }
   // standard section id -> its trimmed name. The file cannot distinguish
   // between two current sections that share a name (there is nothing in the
