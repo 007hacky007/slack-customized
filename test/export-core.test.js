@@ -629,3 +629,82 @@ test('parseSectionsDoc rejects malformed sections and channel ids', () => {
   const notArray = Object.assign(validSectionsDoc(), { sections: 'x' });
   assert.throws(() => core.parseSectionsDoc(JSON.stringify(notArray), 'T123'), /sections/);
 });
+
+const PLAN_CURRENT = () => [
+  { id: 'S1', name: 'Infra', emoji: 'wrench', type: 'standard', channelIds: ['C1'] },
+  { id: 'S2', name: 'Team', emoji: null, type: 'standard', channelIds: ['C2'] },
+  { id: 'SSTAR', name: 'Starred', emoji: null, type: 'stars', channelIds: ['C3'] },
+];
+const PLAN_MEMBERS = () => [
+  { id: 'C1', name: 'backbone' }, { id: 'C2', name: 'dns' },
+  { id: 'C3', name: 'alerts' }, { id: 'C4', name: 'random' },
+];
+
+test('computeSectionsImportPlan: idempotent re-import is an empty plan', () => {
+  const doc = { sections: [
+    { name: 'Infra', emoji: 'wrench', channels: [{ id: 'C1', name: 'backbone' }] },
+    { name: 'Team', emoji: null, channels: [{ id: 'C2', name: 'dns' }] },
+  ]};
+  const plan = core.computeSectionsImportPlan(doc, PLAN_CURRENT(), PLAN_MEMBERS());
+  assert.deepEqual(plan.create, []);
+  assert.deepEqual(plan.moves, []);
+  assert.equal(plan.counts.move, 0);
+  assert.equal(plan.skips.length, 2); // both "already in" skips
+  assert.match(plan.skips[0].reason, /already in/);
+});
+
+test('computeSectionsImportPlan: creates missing sections and moves channels', () => {
+  const doc = { sections: [
+    { name: 'New Stuff', emoji: 'tada', channels: [
+      { id: 'C2', name: 'dns' },   // currently in S2 -> move with remove
+      { id: 'C4', name: 'random' } // unsectioned -> insert only
+    ]},
+  ]};
+  const plan = core.computeSectionsImportPlan(doc, PLAN_CURRENT(), PLAN_MEMBERS());
+  assert.deepEqual(plan.create, [{ name: 'New Stuff', emoji: 'tada' }]);
+  assert.deepEqual(plan.moves, [{
+    sectionName: 'New Stuff', sectionId: null,
+    insertChannelIds: ['C2', 'C4'],
+    removeGroups: [{ sectionId: 'S2', channelIds: ['C2'] }],
+  }]);
+  assert.deepEqual(plan.counts, { create: 1, move: 2, skip: 0 });
+});
+
+test('computeSectionsImportPlan: moving into an existing section by name', () => {
+  const doc = { sections: [
+    { name: 'Infra', emoji: null, channels: [{ id: 'C2', name: 'dns' }] },
+  ]};
+  const plan = core.computeSectionsImportPlan(doc, PLAN_CURRENT(), PLAN_MEMBERS());
+  assert.deepEqual(plan.create, []);
+  assert.deepEqual(plan.moves, [{
+    sectionName: 'Infra', sectionId: 'S1',
+    insertChannelIds: ['C2'],
+    removeGroups: [{ sectionId: 'S2', channelIds: ['C2'] }],
+  }]);
+});
+
+test('computeSectionsImportPlan: skips unknown channels and duplicates (first wins)', () => {
+  const doc = { sections: [
+    { name: 'A', emoji: null, channels: [{ id: 'C4', name: 'random' }, { id: 'C0NOPE', name: 'gone' }] },
+    { name: 'B', emoji: null, channels: [{ id: 'C4', name: 'random' }] },
+  ]};
+  const plan = core.computeSectionsImportPlan(doc, PLAN_CURRENT(), PLAN_MEMBERS());
+  assert.deepEqual(plan.create.map((c) => c.name), ['A', 'B']); // B still created (empty)
+  assert.equal(plan.moves.length, 1);
+  assert.deepEqual(plan.moves[0].insertChannelIds, ['C4']);
+  assert.equal(plan.skips.length, 2);
+  assert.match(plan.skips.find((s) => s.channelId === 'C0NOPE').reason, /not a member|unknown/i);
+  assert.match(plan.skips.find((s) => s.channelId === 'C4').reason, /more than once/);
+});
+
+test('computeSectionsImportPlan: channel only known from a section (e.g. a DM) is movable; starred is never a remove source', () => {
+  const doc = { sections: [
+    { name: 'Infra', emoji: null, channels: [{ id: 'C3', name: 'alerts' }, { id: 'D7', name: null }] },
+  ]};
+  const current = PLAN_CURRENT();
+  current.push({ id: 'S3', name: 'Misc', emoji: null, type: 'standard', channelIds: ['D7'] });
+  const plan = core.computeSectionsImportPlan(doc, current, PLAN_MEMBERS());
+  assert.deepEqual(plan.moves[0].insertChannelIds, ['C3', 'D7']);
+  // C3 sits only in the starred (non-standard) section: insert without removing from Starred
+  assert.deepEqual(plan.moves[0].removeGroups, [{ sectionId: 'S3', channelIds: ['D7'] }]);
+});

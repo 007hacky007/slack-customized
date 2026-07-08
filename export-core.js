@@ -543,6 +543,74 @@ function parseSectionsDoc(text, currentTeamId) {
   return doc;
 }
 
+// Computes the additive plan for applying an imported sections doc.
+// Never plans deletions; channels are only removed from a standard section
+// as the "remove" half of a move requested by the file.
+function computeSectionsImportPlan(doc, currentSections, memberChannels) {
+  const standard = (currentSections || []).filter((s) => s.type === 'standard');
+  const sectionIdByName = new Map();
+  for (const s of standard) {
+    if (!sectionIdByName.has(s.name)) sectionIdByName.set(s.name, s.id);
+  }
+  // channel id -> the standard section it currently sits in (remove source)
+  const currentSectionByChannel = new Map();
+  for (const s of standard) {
+    for (const id of s.channelIds) {
+      if (!currentSectionByChannel.has(id)) currentSectionByChannel.set(id, s.id);
+    }
+  }
+  // A channel is placeable if we are a member of it or it already sits in any
+  // section (covers DMs/group DMs that users.conversations does not return).
+  const known = new Set((memberChannels || []).map((c) => c.id));
+  for (const s of (currentSections || [])) for (const id of s.channelIds) known.add(id);
+
+  const create = [];
+  const moves = [];
+  const skips = [];
+  const seen = new Set();
+  for (const fileSection of (doc.sections || [])) {
+    const name = fileSection.name.trim();
+    const targetId = sectionIdByName.get(name) || null;
+    if (!targetId) create.push({ name, emoji: fileSection.emoji || null });
+    const insertChannelIds = [];
+    const removeBySection = new Map();
+    for (const ch of (fileSection.channels || [])) {
+      if (seen.has(ch.id)) {
+        skips.push({ channelId: ch.id, name: ch.name || null, reason: 'listed more than once; first placement wins' });
+        continue;
+      }
+      seen.add(ch.id);
+      if (!known.has(ch.id)) {
+        skips.push({ channelId: ch.id, name: ch.name || null, reason: 'not a member of this channel (unknown id)' });
+        continue;
+      }
+      const from = currentSectionByChannel.get(ch.id) || null;
+      if (targetId && from === targetId) {
+        skips.push({ channelId: ch.id, name: ch.name || null, reason: 'already in "' + name + '"' });
+        continue;
+      }
+      insertChannelIds.push(ch.id);
+      if (from) {
+        if (!removeBySection.has(from)) removeBySection.set(from, []);
+        removeBySection.get(from).push(ch.id);
+      }
+    }
+    if (insertChannelIds.length) {
+      moves.push({
+        sectionName: name,
+        sectionId: targetId,
+        insertChannelIds,
+        removeGroups: Array.from(removeBySection, ([sectionId, channelIds]) => ({ sectionId, channelIds })),
+      });
+    }
+  }
+  const moveCount = moves.reduce((n, m) => n + m.insertChannelIds.length, 0);
+  return {
+    create, moves, skips,
+    counts: { create: create.length, move: moveCount, skip: skips.length },
+  };
+}
+
 async function fetchThreadReplies(apiCall, opts, hooks) {
   hooks = hooks || {};
   const channel = opts.channel;
@@ -700,5 +768,5 @@ module.exports = {
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
   TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory, fetchThreadReplies,
-  backfillReactions, resolveActors, runExport, normalizeSections, SECTIONS_EXPORT_FORMAT, SECTIONS_EXPORT_VERSION, buildSectionsDoc, parseSectionsDoc,
+  backfillReactions, resolveActors, runExport, normalizeSections, SECTIONS_EXPORT_FORMAT, SECTIONS_EXPORT_VERSION, buildSectionsDoc, parseSectionsDoc, computeSectionsImportPlan,
 };
