@@ -24,6 +24,7 @@ everywhere else.
 - Channel export to JSON: full message history with threads, reactions
   (author lists backfilled), and resolved user names
 - Channel list export: public/private/all membership as JSON or plain text
+- Channel sections export/import: sidebar sections plus unsectioned channels to JSON, file embeds its own schema and editing instructions for hand- or LLM-editing, import is additive and previews a plan with Apply/Cancel before changing anything
 - Reaction analytics CLI (`analyze-reactions.js`)
 - Thread pop-out button in every thread header
 - Esc closes attachment views; "Clear Cache (Keep Login)" menu item
