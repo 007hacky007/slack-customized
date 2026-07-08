@@ -492,6 +492,57 @@ function buildSectionsDoc(sections, channels, ctx) {
   };
 }
 
+const SECTIONS_CHANNEL_ID_RE = /^[CDG][A-Z0-9]+$/;
+
+// Validates an imported sections file. Throws Error with a user-facing message.
+// The embedded `instructions` and `schema` fields are intentionally ignored.
+function parseSectionsDoc(text, currentTeamId) {
+  let doc;
+  try {
+    doc = JSON.parse(text);
+  } catch (e) {
+    throw new Error('Not valid JSON: ' + e.message);
+  }
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+    throw new Error('Not a sections export (expected a JSON object).');
+  }
+  if (doc.format !== SECTIONS_EXPORT_FORMAT) {
+    throw new Error('Not a sections export (expected format "' + SECTIONS_EXPORT_FORMAT + '").');
+  }
+  if (!Number.isInteger(doc.version)) {
+    throw new Error('Missing or invalid "version" (integer required).');
+  }
+  if (doc.version > SECTIONS_EXPORT_VERSION) {
+    throw new Error('This file was created by a newer version of the app (file version '
+      + doc.version + ', supported up to ' + SECTIONS_EXPORT_VERSION + ').');
+  }
+  if (!doc.workspace || typeof doc.workspace.id !== 'string' || !doc.workspace.id) {
+    throw new Error('Missing "workspace.id".');
+  }
+  if (currentTeamId && doc.workspace.id !== currentTeamId) {
+    throw new Error('Workspace mismatch: file is for ' + doc.workspace.id
+      + (doc.workspace.name ? ' (' + doc.workspace.name + ')' : '')
+      + ', current workspace is ' + currentTeamId + '.');
+  }
+  if (!Array.isArray(doc.sections)) {
+    throw new Error('Missing "sections" array.');
+  }
+  doc.sections.forEach((s, i) => {
+    const where = 'sections[' + i + ']';
+    if (!s || typeof s !== 'object' || Array.isArray(s)) throw new Error(where + ' is not an object.');
+    if (typeof s.name !== 'string' || !s.name.trim()) throw new Error(where + ' has no name.');
+    if (s.emoji != null && typeof s.emoji !== 'string') throw new Error(where + ' ("' + s.name + '"): emoji must be a string or null.');
+    if (!Array.isArray(s.channels)) throw new Error(where + ' ("' + s.name + '") has no channels array.');
+    s.channels.forEach((c, j) => {
+      if (!c || typeof c.id !== 'string' || !SECTIONS_CHANNEL_ID_RE.test(c.id)) {
+        throw new Error(where + ' ("' + s.name + '") channels[' + j + '] has a bad channel id'
+          + (c && typeof c.id === 'string' ? ': "' + c.id + '"' : '.'));
+      }
+    });
+  });
+  return doc;
+}
+
 async function fetchThreadReplies(apiCall, opts, hooks) {
   hooks = hooks || {};
   const channel = opts.channel;
@@ -649,5 +700,5 @@ module.exports = {
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
   TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory, fetchThreadReplies,
-  backfillReactions, resolveActors, runExport, normalizeSections, SECTIONS_EXPORT_FORMAT, SECTIONS_EXPORT_VERSION, buildSectionsDoc,
+  backfillReactions, resolveActors, runExport, normalizeSections, SECTIONS_EXPORT_FORMAT, SECTIONS_EXPORT_VERSION, buildSectionsDoc, parseSectionsDoc,
 };

@@ -575,3 +575,57 @@ test('buildSectionsDoc builds doc with standard sections, unsectioned, schema an
     { id: 'C2', name: 'dns' }, { id: 'C3', name: 'random' },
   ]);
 });
+
+function validSectionsDoc() {
+  return {
+    format: 'slack-sections-export', version: 1,
+    workspace: { id: 'T123', name: 'acme' },
+    sections: [
+      { name: 'Infra', emoji: 'wrench', channels: [{ id: 'C0AAA', name: 'backbone' }] },
+    ],
+    unsectioned: [{ id: 'C0CCC', name: 'random' }],
+  };
+}
+
+test('parseSectionsDoc accepts a valid doc', () => {
+  const doc = core.parseSectionsDoc(JSON.stringify(validSectionsDoc()), 'T123');
+  assert.equal(doc.sections[0].name, 'Infra');
+});
+
+test('parseSectionsDoc rejects bad json, format, version', () => {
+  assert.throws(() => core.parseSectionsDoc('{nope', 'T123'), /JSON/);
+  const wrongFormat = Object.assign(validSectionsDoc(), { format: 'other' });
+  assert.throws(() => core.parseSectionsDoc(JSON.stringify(wrongFormat), 'T123'), /format/);
+  const newer = Object.assign(validSectionsDoc(), { version: 2 });
+  assert.throws(() => core.parseSectionsDoc(JSON.stringify(newer), 'T123'), /newer version/);
+  const noVersion = validSectionsDoc(); delete noVersion.version;
+  assert.throws(() => core.parseSectionsDoc(JSON.stringify(noVersion), 'T123'), /version/);
+});
+
+test('parseSectionsDoc rejects workspace mismatch and missing workspace', () => {
+  assert.throws(() => core.parseSectionsDoc(JSON.stringify(validSectionsDoc()), 'T999'), /Workspace mismatch/);
+  const noWs = validSectionsDoc(); delete noWs.workspace;
+  assert.throws(() => core.parseSectionsDoc(JSON.stringify(noWs), 'T123'), /workspace/);
+  // no currentTeamId -> mismatch check skipped
+  assert.ok(core.parseSectionsDoc(JSON.stringify(validSectionsDoc()), null));
+});
+
+test('parseSectionsDoc round-trips a buildSectionsDoc export', () => {
+  const doc = core.buildSectionsDoc(
+    [{ id: 'S1', name: 'A', emoji: null, type: 'standard', channelIds: ['C1'] }],
+    [{ id: 'C1', name: 'one', is_private: false }],
+    { exportedAt: 'x', teamId: 'T123', workspace: { team_id: 'T123', name: 'acme' } });
+  const parsed = core.parseSectionsDoc(JSON.stringify(doc), 'T123');
+  assert.equal(parsed.sections.length, 1);
+});
+
+test('parseSectionsDoc rejects malformed sections and channel ids', () => {
+  const noName = validSectionsDoc(); noName.sections[0].name = '  ';
+  assert.throws(() => core.parseSectionsDoc(JSON.stringify(noName), 'T123'), /name/);
+  const badId = validSectionsDoc(); badId.sections[0].channels[0].id = 'lowercase';
+  assert.throws(() => core.parseSectionsDoc(JSON.stringify(badId), 'T123'), /channel id/);
+  const noChannels = validSectionsDoc(); delete noChannels.sections[0].channels;
+  assert.throws(() => core.parseSectionsDoc(JSON.stringify(noChannels), 'T123'), /channels/);
+  const notArray = Object.assign(validSectionsDoc(), { sections: 'x' });
+  assert.throws(() => core.parseSectionsDoc(JSON.stringify(notArray), 'T123'), /sections/);
+});
