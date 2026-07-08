@@ -20,11 +20,11 @@
 - File format: `format: "slack-sections-export"`, `version: 1`; import rejects `version > 1` with a "newer version of the app" error and rejects workspace-ID mismatches.
 - No em-dashes or en-dashes anywhere (code, comments, docs); hyphen-minus only.
 - Tests run with: `node --test test/export-core.test.js` from the repo root.
-- Assumed endpoint shapes (Task 1 verifies and corrects these before any dependent code is written):
-  - `users.channelSections.list` -> `{ ok, channel_sections: [{ channel_section_id, name, emoji, type, channel_ids_page: { channel_ids: [...] } }] }`; user-created sections have `type: "standard"`.
-  - `users.channelSections.create` params `name`, `emoji` (colon-wrapped, e.g. `:wrench:`, empty string for none) -> `{ ok, channel_section_id }`.
-  - `users.channelSections.channels.bulkUpdate` params `insert`, `remove`, each a JSON-encoded array of `{ channel_section_id, channel_ids: [...] }` -> `{ ok }`.
-  - `users.channelSections.delete` params `channel_section_id` (used ONLY for Task 1 cleanup, never by the feature).
+- Endpoint shapes (VERIFIED live by Task 1 on 2026-07-08; details in `2026-07-08-sections-endpoint-notes.md`):
+  - `users.channelSections.list` -> `{ ok, channel_sections: [{ channel_section_id, name, emoji, type, channel_ids_page: { channel_ids: [...], count, cursor } }] }`; user-created sections have `type: "standard"` (built-ins observed: `stars`, `channels`, `direct_messages`, `slack_connect`, `recent_apps`, `agents`, `salesforce_records`). Emoji comes back WITHOUT wrapping colons (`""` for none; skin tones as `older_man::skin-tone-6` with an interior `::`). `channel_ids_page.count` may exceed `channel_ids.length` (left/archived channels); use `channel_ids` as-is. The default `channels` bucket returns no ids, so unsectioned channels must be computed as member channels minus sectioned ids.
+  - `users.channelSections.create` params `name`, `emoji` (BARE emoji name, e.g. `wrench`; colon-wrapped `:wrench:` fails with `emoji_invalid`; omit the param when there is no emoji) -> `{ ok, channel_section_id }`.
+  - `users.channelSections.channels.bulkUpdate` params `insert`, `remove`, each a JSON-encoded array of `{ channel_section_id, channel_ids: [...] }` -> `{ ok }`; either param may be an empty array or omitted entirely.
+  - `users.channelSections.delete` params `channel_section_id` -> `{ ok }` (used ONLY for Task 1 cleanup, never by the feature).
 
 ---
 
@@ -38,13 +38,13 @@
 
 The custom app normally runs with `--remote-debugging-port=9222` (raw CDP; the chrome-devtools MCP is not attached to it). All calls run inside the Slack page context, so the page's own cookies apply; the xoxc token comes from `localStorage.localConfig_v2`.
 
-- [ ] **Step 1: Confirm the app is running with CDP available**
+- [x] **Step 1: Confirm the app is running with CDP available**
 
 Run: `curl -s http://127.0.0.1:9222/json | head -40`
 Expected: JSON array of targets; find the one whose `url` contains `app.slack.com/client` (or the workspace domain). Note its `webSocketDebuggerUrl`.
 If the curl fails, ask the user to start `/Applications/SlackAutocompleteElectron.app` (it already ships with the debug port) and wait for it.
 
-- [ ] **Step 2: Write the CDP probe script**
+- [x] **Step 2: Write the CDP probe script**
 
 Create `scratchpad/sections-probe.mjs` (in the session scratchpad directory, not the repo). Node 20+ has a global `WebSocket`.
 
@@ -69,7 +69,7 @@ ws.onmessage = (m) => {
 setTimeout(() => { console.error('timeout'); process.exit(1); }, 30000);
 ```
 
-- [ ] **Step 3: Probe users.channelSections.list**
+- [x] **Step 3: Probe users.channelSections.list**
 
 Create `scratchpad/expr-list.js`:
 
@@ -91,18 +91,18 @@ Run: `node scratchpad/sections-probe.mjs "<webSocketDebuggerUrl>" scratchpad/exp
 Expected: JSON with `ok: true` and a `channel_sections` array. Record in the notes file: the exact key names (`channel_section_id` vs `id`), the `type` values present, how emoji is encoded (with or without colons), and where channel ids live (`channel_ids_page.channel_ids` or elsewhere).
 If the fetch is blocked by CORS (page origin is `app.slack.com`, API host is the workspace domain), retry with `base = 'https://app.slack.com/'` if `cfg.teams[teamId]` has no url, or fall back to observing traffic: send `Network.enable` over the same WebSocket, ask the user to collapse/expand a section in the sidebar, and read the request/response of the `users.channelSections.list` call Slack itself makes.
 
-- [ ] **Step 4: Probe create, bulkUpdate, delete on a throwaway section**
+- [x] **Step 4: Probe create, bulkUpdate, delete on a throwaway section**
 
 Create `scratchpad/expr-create.js` (same structure as expr-list.js, body params: `name=zz-sections-verify`, `emoji=:wrench:`). Record the response shape (where the new section id is).
 Then `scratchpad/expr-bulk.js`: pick one public channel id from the list probe's default "channels" bucket or from `unsectioned`, and send `insert=[{"channel_section_id":"<newId>","channel_ids":["<C...>"]}]` and `remove=[]` to `users.channelSections.channels.bulkUpdate`. Record whether `remove` may be empty/omitted and whether values must be JSON strings.
 Then move it back out: `insert=[]`, `remove=[{"channel_section_id":"<newId>","channel_ids":["<C...>"]}]`.
 Finally `scratchpad/expr-delete.js`: `users.channelSections.delete` with `channel_section_id=<newId>`. Verify via a final list probe that `zz-sections-verify` is gone and the moved channel is back where it was.
 
-- [ ] **Step 5: Write the findings file and reconcile the plan**
+- [x] **Step 5: Write the findings file and reconcile the plan**
 
 Write `docs/superpowers/plans/2026-07-08-sections-endpoint-notes.md` with: each endpoint, exact params sent, exact response received (redact tokens and real channel names if any). If any shape differs from the Global Constraints assumptions, update the affected code blocks in Tasks 2, 7, 8 of this plan file now, before those tasks run.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add docs/superpowers/plans/2026-07-08-sections-endpoint-notes.md docs/superpowers/plans/2026-07-08-channel-sections-export-import.md
@@ -126,16 +126,21 @@ git commit -m "docs: verified users.channelSections endpoint shapes"
 Append to `test/export-core.test.js`:
 
 ```js
-test('normalizeSections maps list response, strips emoji colons', () => {
+test('normalizeSections maps list response, strips only wrapping emoji colons', () => {
+  // Live-verified: list returns emoji WITHOUT wrapping colons ('' for none),
+  // and skin-tone emoji keep an interior '::' that must survive normalization.
   const resp = { ok: true, channel_sections: [
     { channel_section_id: 'S1', name: 'Infra', emoji: ':wrench:', type: 'standard',
-      channel_ids_page: { channel_ids: ['C1', 'C2'] } },
-    { channel_section_id: 'S2', name: 'Starred', emoji: '', type: 'starred',
-      channel_ids_page: { channel_ids: [] } },
+      channel_ids_page: { channel_ids: ['C1', 'C2'], count: 2, cursor: 'C2' } },
+    { channel_section_id: 'S2', name: 'Starred', emoji: '', type: 'stars',
+      channel_ids_page: { channel_ids: [], count: 0 } },
+    { channel_section_id: 'S3', name: 'People', emoji: 'older_man::skin-tone-6', type: 'standard',
+      channel_ids_page: { channel_ids: ['C3'], count: 1, cursor: 'C3' } },
   ]};
   assert.deepEqual(core.normalizeSections(resp), [
     { id: 'S1', name: 'Infra', emoji: 'wrench', type: 'standard', channelIds: ['C1', 'C2'] },
-    { id: 'S2', name: 'Starred', emoji: null, type: 'starred', channelIds: [] },
+    { id: 'S2', name: 'Starred', emoji: null, type: 'stars', channelIds: [] },
+    { id: 'S3', name: 'People', emoji: 'older_man::skin-tone-6', type: 'standard', channelIds: ['C3'] },
   ]);
 });
 
@@ -169,7 +174,10 @@ In `export-core.js`, after `formatChannelListText` (around line 380), add:
 // ===================== Channel sections export/import =====================
 
 // Normalizes a users.channelSections.list response into plain section objects.
-// Emoji is stored without colons (":wrench:" -> "wrench"); empty -> null.
+// Live-verified: the API returns emoji WITHOUT wrapping colons already ("" for
+// none, "wrench", skin tones as "older_man::skin-tone-6"). Strip only wrapping
+// colons (defensive, e.g. ":wrench:" -> "wrench") so the interior "::" of a
+// skin-tone emoji survives; empty -> null.
 function normalizeSections(resp) {
   if (!resp || resp.ok === false) {
     throw new Error('users.channelSections.list failed: ' + (resp && resp.error));
@@ -179,7 +187,7 @@ function normalizeSections(resp) {
     .map((s) => ({
       id: (s && (s.channel_section_id || s.id)) || null,
       name: (s && typeof s.name === 'string') ? s.name : '',
-      emoji: (s && typeof s.emoji === 'string' && s.emoji.replace(/:/g, '')) || null,
+      emoji: (s && typeof s.emoji === 'string' && s.emoji.replace(/^:+|:+$/g, '')) || null,
       type: (s && s.type) || 'standard',
       channelIds: (s && s.channel_ids_page && Array.isArray(s.channel_ids_page.channel_ids))
         ? s.channel_ids_page.channel_ids.slice()
@@ -225,7 +233,7 @@ Append to `test/export-core.test.js`:
 test('buildSectionsDoc builds doc with standard sections, unsectioned, schema and instructions', () => {
   const sections = [
     { id: 'S1', name: 'Infra', emoji: 'wrench', type: 'standard', channelIds: ['C1', 'D9'] },
-    { id: 'S2', name: 'Starred', emoji: null, type: 'starred', channelIds: ['C2'] },
+    { id: 'S2', name: 'Starred', emoji: null, type: 'stars', channelIds: ['C2'] },
   ];
   const channels = [
     { id: 'C1', name: 'backbone', is_private: false },
@@ -552,7 +560,7 @@ Append to `test/export-core.test.js`:
 const PLAN_CURRENT = () => [
   { id: 'S1', name: 'Infra', emoji: 'wrench', type: 'standard', channelIds: ['C1'] },
   { id: 'S2', name: 'Team', emoji: null, type: 'standard', channelIds: ['C2'] },
-  { id: 'SSTAR', name: 'Starred', emoji: null, type: 'starred', channelIds: ['C3'] },
+  { id: 'SSTAR', name: 'Starred', emoji: null, type: 'stars', channelIds: ['C3'] },
 ];
 const PLAN_MEMBERS = () => [
   { id: 'C1', name: 'backbone' }, { id: 'C2', name: 'dns' },
@@ -996,7 +1004,11 @@ After the export-sections listener from Task 7 (before its `// =================
       for (const s of plan.create) {
         if (ac.signal.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
         overlay.setProgress('Applying', ++step, totalSteps);
-        const params = { name: s.name, emoji: s.emoji ? ':' + s.emoji + ':' : '' };
+        // Live-verified: create takes a BARE emoji name ('wrench'); the
+        // colon-wrapped form ':wrench:' fails with emoji_invalid. Omit the
+        // param entirely when the section has no emoji ('' is unverified).
+        const params = { name: s.name };
+        if (s.emoji) params.emoji = s.emoji;
         const r = await apiCall('users.channelSections.create', params);
         if (!r || r.ok === false || !r.channel_section_id) {
           failed++; log('create "' + s.name + '" FAILED: ' + ((r && r.error) || 'no id returned'));
