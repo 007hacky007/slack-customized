@@ -544,3 +544,34 @@ test('normalizeSections throws on error responses', () => {
   assert.throws(() => core.normalizeSections({ ok: false, error: 'invalid_auth' }), /invalid_auth/);
   assert.throws(() => core.normalizeSections(null), /users\.channelSections\.list failed/);
 });
+
+test('buildSectionsDoc builds doc with standard sections, unsectioned, schema and instructions', () => {
+  const sections = [
+    { id: 'S1', name: 'Infra', emoji: 'wrench', type: 'standard', channelIds: ['C1', 'D9'] },
+    { id: 'S2', name: 'Starred', emoji: null, type: 'stars', channelIds: ['C2'] },
+  ];
+  const channels = [
+    { id: 'C1', name: 'backbone', is_private: false },
+    { id: 'C2', name: 'dns', is_private: false },
+    { id: 'C3', name: 'random', is_private: false },
+  ];
+  const doc = core.buildSectionsDoc(sections, channels, {
+    exportedAt: '2026-07-08T12:00:00.000Z', teamId: 'T123',
+    workspace: { team_id: 'T123', name: 'acme' },
+  });
+  assert.equal(doc.format, 'slack-sections-export');
+  assert.equal(doc.version, 1);
+  assert.equal(doc.exportedAt, '2026-07-08T12:00:00.000Z');
+  assert.deepEqual(doc.workspace, { id: 'T123', name: 'acme' });
+  assert.ok(Array.isArray(doc.instructions) && doc.instructions.length >= 5);
+  assert.equal(doc.schema.properties.format.const, 'slack-sections-export');
+  // starred section excluded; D9 kept with null name (not a member channel)
+  assert.deepEqual(doc.sections, [
+    { name: 'Infra', emoji: 'wrench', channels: [
+      { id: 'C1', name: 'backbone' }, { id: 'D9', name: null } ] },
+  ]);
+  // C2 is only in a non-standard section, so it counts as unsectioned
+  assert.deepEqual(doc.unsectioned, [
+    { id: 'C2', name: 'dns' }, { id: 'C3', name: 'random' },
+  ]);
+});

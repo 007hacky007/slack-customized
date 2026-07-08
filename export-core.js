@@ -404,6 +404,94 @@ function normalizeSections(resp) {
     .filter((s) => s.id);
 }
 
+const SECTIONS_EXPORT_FORMAT = 'slack-sections-export';
+const SECTIONS_EXPORT_VERSION = 1;
+
+// Baked into every exported file so a human or an LLM editing it has the
+// contract inline. Import ignores these fields (it has its own validation).
+const SECTIONS_EXPORT_INSTRUCTIONS = [
+  "This file maps Slack sidebar sections to channels. To reorganize, move channel objects between the 'channels' arrays of sections, or from 'unsectioned' into a section.",
+  "To create a new section, add an object to 'sections' with a 'name', an optional 'emoji' (emoji name without colons), and a 'channels' array.",
+  "Channels are matched by 'id' on import; 'name' is informational only. Do not invent channel ids.",
+  "Import is additive: it creates missing sections and moves the listed channels into them. It never deletes sections or removes channels from sections. Channels left in 'unsectioned' are ignored on import.",
+  "Each channel id should appear at most once across all sections; if it appears more than once, the first placement wins.",
+  "Do not modify 'format', 'version', 'workspace', or 'schema'.",
+];
+
+const SECTIONS_EXPORT_SCHEMA = {
+  $schema: 'http://json-schema.org/draft-07/schema#',
+  type: 'object',
+  required: ['format', 'version', 'workspace', 'sections'],
+  properties: {
+    format: { const: SECTIONS_EXPORT_FORMAT },
+    version: { type: 'integer' },
+    exportedAt: { type: 'string' },
+    workspace: {
+      type: 'object',
+      required: ['id'],
+      properties: { id: { type: 'string' }, name: { type: 'string' } },
+    },
+    instructions: { type: 'array', items: { type: 'string' } },
+    sections: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['name', 'channels'],
+        properties: {
+          name: { type: 'string', minLength: 1 },
+          emoji: { type: ['string', 'null'] },
+          channels: { $ref: '#/definitions/channelList' },
+        },
+      },
+    },
+    unsectioned: { $ref: '#/definitions/channelList' },
+  },
+  definitions: {
+    channelList: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['id'],
+        properties: {
+          id: { type: 'string', pattern: '^[CDG][A-Z0-9]+$' },
+          name: { type: ['string', 'null'] },
+        },
+      },
+    },
+  },
+};
+
+function buildSectionsDoc(sections, channels, ctx) {
+  ctx = ctx || {};
+  const standard = (sections || []).filter((s) => s.type === 'standard');
+  const nameById = new Map((channels || []).map((c) => [c.id, c.name || null]));
+  const sectioned = new Set();
+  const outSections = standard.map((s) => ({
+    name: s.name,
+    emoji: s.emoji || null,
+    channels: s.channelIds.map((id) => {
+      sectioned.add(id);
+      return { id, name: nameById.get(id) || null };
+    }),
+  }));
+  const unsectioned = (channels || [])
+    .filter((c) => !sectioned.has(c.id))
+    .map((c) => ({ id: c.id, name: c.name || null }));
+  return {
+    format: SECTIONS_EXPORT_FORMAT,
+    version: SECTIONS_EXPORT_VERSION,
+    exportedAt: ctx.exportedAt || null,
+    workspace: {
+      id: ctx.teamId || null,
+      name: (ctx.workspace && ctx.workspace.name) || null,
+    },
+    instructions: SECTIONS_EXPORT_INSTRUCTIONS.slice(),
+    schema: SECTIONS_EXPORT_SCHEMA,
+    sections: outSections,
+    unsectioned,
+  };
+}
+
 async function fetchThreadReplies(apiCall, opts, hooks) {
   hooks = hooks || {};
   const channel = opts.channel;
@@ -561,5 +649,5 @@ module.exports = {
   getNextCursor, responseHasMore, accumulateByTs, finalizeThreadReplies, reactionNeedsBackfill, messageNeedsReactionBackfill,
   resolveActorRef, buildUserEntry, buildBotEntry, collectActorRefs, pickInlineName, createReport,
   TIERS, methodTier, tierIntervalMs, parseRetryAfter, backoffDelay, streamExportJson, fetchAllHistory, fetchThreadReplies,
-  backfillReactions, resolveActors, runExport, normalizeSections,
+  backfillReactions, resolveActors, runExport, normalizeSections, SECTIONS_EXPORT_FORMAT, SECTIONS_EXPORT_VERSION, buildSectionsDoc,
 };
