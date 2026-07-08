@@ -4873,10 +4873,10 @@ cat > preload.js <<'EOF'
         if (ac.signal.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
         overlay.setProgress('Applying', ++step, totalSteps);
         // Live-verified: create takes a BARE emoji name ('wrench'); the
-        // colon-wrapped form ':wrench:' fails with emoji_invalid. Omit the
-        // param entirely when the section has no emoji ('' is unverified).
-        const params = { name: s.name };
-        if (s.emoji) params.emoji = s.emoji;
+        // colon-wrapped form ':wrench:' fails with emoji_invalid, and OMITTING
+        // the param fails with invalid_arguments - it must always be sent,
+        // as an empty string when the section has no emoji.
+        const params = { name: s.name, emoji: s.emoji || '' };
         // createApiCall retries 5xx/transport errors, and create is not
         // idempotent: if the request actually succeeded but the success
         // response was lost, the retry creates a duplicate section. Accepted

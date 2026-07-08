@@ -111,12 +111,11 @@ Request params sent: `token`, `name=zz-sections-verify`, `emoji=wrench`.
 - The new section id lives at top-level `channel_section_id`, as assumed.
 - A follow-up `list` showed the new section appended last
   (`next_channel_section_id: null`) with `emoji: "wrench"` echoed back bare.
-- NOT tested (one-throwaway-section budget): creating with `emoji=""` or
-  with the `emoji` param omitted. Existing standard sections with
-  `emoji: ""` prove no-emoji sections are creatable; since `""` was not
-  verified and `:wrench:` proved the endpoint validates the emoji value,
-  the safest client behavior is to OMIT the `emoji` param entirely when
-  there is no emoji.
+- No-emoji create, verified live during the Task 9 smoke test (2026-07-08):
+  OMITTING the `emoji` param fails with `invalid_arguments`; sending
+  `emoji=""` (param present, empty string) succeeds. The `emoji` param is
+  therefore mandatory and the client always sends it, empty when the
+  section has no emoji.
 
 ## users.channelSections.channels.bulkUpdate
 

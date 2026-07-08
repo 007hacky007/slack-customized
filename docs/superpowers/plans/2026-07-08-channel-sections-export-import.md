@@ -22,7 +22,7 @@
 - Tests run with: `node --test test/export-core.test.js` from the repo root.
 - Endpoint shapes (VERIFIED live by Task 1 on 2026-07-08; details in `2026-07-08-sections-endpoint-notes.md`):
   - `users.channelSections.list` -> `{ ok, channel_sections: [{ channel_section_id, name, emoji, type, channel_ids_page: { channel_ids: [...], count, cursor } }] }`; user-created sections have `type: "standard"` (built-ins observed: `stars`, `channels`, `direct_messages`, `slack_connect`, `recent_apps`, `agents`, `salesforce_records`). Emoji comes back WITHOUT wrapping colons (`""` for none; skin tones as `older_man::skin-tone-6` with an interior `::`). `channel_ids_page.count` may exceed `channel_ids.length` (left/archived channels); use `channel_ids` as-is. The default `channels` bucket returns no ids, so unsectioned channels must be computed as member channels minus sectioned ids.
-  - `users.channelSections.create` params `name`, `emoji` (BARE emoji name, e.g. `wrench`; colon-wrapped `:wrench:` fails with `emoji_invalid`; omit the param when there is no emoji) -> `{ ok, channel_section_id }`.
+  - `users.channelSections.create` params `name`, `emoji` (BARE emoji name, e.g. `wrench`; colon-wrapped `:wrench:` fails with `emoji_invalid`; the param is MANDATORY - omitting it fails with `invalid_arguments`, send `""` when there is no emoji) -> `{ ok, channel_section_id }`.
   - `users.channelSections.channels.bulkUpdate` params `insert`, `remove`, each a JSON-encoded array of `{ channel_section_id, channel_ids: [...] }` -> `{ ok }`; either param may be an empty array or omitted entirely.
   - `users.channelSections.delete` params `channel_section_id` -> `{ ok }` (used ONLY for Task 1 cleanup, never by the feature).
 
@@ -1011,10 +1011,10 @@ After the export-sections listener from Task 7 (before its `// =================
         if (ac.signal.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
         overlay.setProgress('Applying', ++step, totalSteps);
         // Live-verified: create takes a BARE emoji name ('wrench'); the
-        // colon-wrapped form ':wrench:' fails with emoji_invalid. Omit the
-        // param entirely when the section has no emoji ('' is unverified).
-        const params = { name: s.name };
-        if (s.emoji) params.emoji = s.emoji;
+        // colon-wrapped form ':wrench:' fails with emoji_invalid, and OMITTING
+        // the param fails with invalid_arguments - it must always be sent,
+        // as an empty string when the section has no emoji.
+        const params = { name: s.name, emoji: s.emoji || '' };
         // createApiCall retries 5xx/transport errors, and create is not
         // idempotent: if the request actually succeeded but the success
         // response was lost, the retry creates a duplicate section. Accepted
