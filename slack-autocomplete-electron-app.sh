@@ -4592,6 +4592,21 @@ cat > preload.js <<'EOF'
         if (total && total > 0) { barDeterminate(Math.round((cur / total) * 100)); phase.textContent = label + ' ' + cur + ' / ' + total; }
         else { barIndeterminate(); phase.textContent = label + ' ' + cur + '...'; }
       },
+      // Plan confirmation gate: shows an Apply button next to Cancel and
+      // resolves true (Apply) or false (Cancel). Nothing is mutated before Apply.
+      confirm(text) {
+        phase.textContent = text;
+        barDeterminate(0);
+        return new Promise((resolve) => {
+          const applyBtn = document.createElement('button');
+          applyBtn.textContent = 'Apply';
+          applyBtn.style.cssText = 'background:#007a5a;color:#fff;border:0;border-radius:6px;padding:7px 14px;cursor:pointer;font-size:13px;margin-right:8px;';
+          box.insertBefore(applyBtn, cancelBtn);
+          applyBtn.addEventListener('click', () => { applyBtn.remove(); resolve(true); });
+          const prevCancel = cancelCb;
+          cancelCb = () => { applyBtn.remove(); resolve(false); if (prevCancel) prevCancel(); };
+        });
+      },
       done(text) { title.textContent = 'Export complete'; phase.textContent = text; barDeterminate(100); cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); },
       fail(text) { title.textContent = 'Export failed'; phase.textContent = text; barDeterminate(100); bar.style.background = '#e01e5a'; cancelBtn.textContent = 'Close'; cancelBtn.disabled = false; cancelBtn.onclick = () => root.remove(); },
       destroy() { if (root.parentNode) root.remove(); },
@@ -4792,6 +4807,109 @@ cat > preload.js <<'EOF'
     }
   });
   // =================== end channel sections export ===================
+
+  // ===================== Channel sections import (web API) =====================
+  // Additive apply: creates missing sections, moves listed channels into them.
+  // Never deletes anything. Nothing is mutated before the user clicks Apply.
+  ipcRenderer.on('slack-autocomplete:import-sections', async () => {
+    if (exportInProgress) return;
+    exportInProgress = true;
+    const overlay = createExportOverlay('Importing channel sections...');
+    const log = (msg) => { try { console.log('[slack-sections]', msg); } catch (e) {} overlay.appendLog(msg); };
+    const ac = new AbortController();
+    overlay.onCancel(() => { log('cancel requested'); ac.abort(); });
+    try {
+      const picked = await ipcRenderer.invoke('slack-autocomplete:open-import');
+      if (picked && picked.canceled) { overlay.destroy(); return; }
+      log('file: ' + picked.path);
+
+      const cfg = getExportConfig(log, { requireChannel: false });
+      const apiCall = createApiCall(cfg, ac.signal, log);
+      const doc = exportCore.parseSectionsDoc(picked.content, cfg.teamId);
+      log('file ok: ' + doc.sections.length + ' sections (version ' + doc.version + ')');
+
+      overlay.setPhase('Fetching current sections...');
+      const currentSections = exportCore.normalizeSections(await apiCall('users.channelSections.list', {}));
+      const channels = await exportCore.fetchAllMemberChannels(apiCall,
+        { types: 'public_channel,private_channel' }, {
+          signal: ac.signal,
+          onProgress: (p, cur, total) => {
+            overlay.setProgress(phaseLabel(p), cur, total);
+            log(phaseLabel(p) + ': ' + cur + ' so far');
+          },
+        });
+
+      const plan = exportCore.computeSectionsImportPlan(doc, currentSections, channels);
+      for (const s of plan.skips) {
+        log('skip ' + (s.name ? '#' + s.name : s.channelId) + ': ' + s.reason);
+      }
+      log('plan: create ' + plan.counts.create + ' sections, move '
+        + plan.counts.move + ' channels, skip ' + plan.counts.skip);
+
+      if (plan.counts.create === 0 && plan.counts.move === 0) {
+        overlay.done('Nothing to do: everything in the file is already in place'
+          + (plan.counts.skip ? ' (' + plan.counts.skip + ' skipped, see log)' : '') + '.');
+        return;
+      }
+
+      const ok = await overlay.confirm('Create ' + plan.counts.create + ' sections, move '
+        + plan.counts.move + ' channels, skip ' + plan.counts.skip + '. Apply?');
+      if (!ok) { log('canceled at confirmation'); overlay.done('Import canceled. Nothing was changed.'); return; }
+
+      // Execute: create sections first so moves have a target id.
+      const idByName = new Map();
+      let created = 0, moved = 0, failed = 0;
+      let step = 0;
+      const totalSteps = plan.create.length + plan.moves.length;
+      for (const s of plan.create) {
+        if (ac.signal.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
+        overlay.setProgress('Applying', ++step, totalSteps);
+        // Live-verified: create takes a BARE emoji name ('wrench'); the
+        // colon-wrapped form ':wrench:' fails with emoji_invalid. Omit the
+        // param entirely when the section has no emoji ('' is unverified).
+        const params = { name: s.name };
+        if (s.emoji) params.emoji = s.emoji;
+        const r = await apiCall('users.channelSections.create', params);
+        if (!r || r.ok === false || !r.channel_section_id) {
+          failed++; log('create "' + s.name + '" FAILED: ' + ((r && r.error) || 'no id returned'));
+          continue;
+        }
+        created++; idByName.set(s.name, r.channel_section_id);
+        log('created "' + s.name + '" (' + r.channel_section_id + ')');
+      }
+      for (const m of plan.moves) {
+        if (ac.signal.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
+        overlay.setProgress('Applying', ++step, totalSteps);
+        const targetId = m.sectionId || idByName.get(m.sectionName);
+        if (!targetId) {
+          failed++; log('move into "' + m.sectionName + '" SKIPPED: section was not created');
+          continue;
+        }
+        const params = {
+          insert: JSON.stringify([{ channel_section_id: targetId, channel_ids: m.insertChannelIds }]),
+          remove: JSON.stringify(m.removeGroups.map((g) => ({ channel_section_id: g.sectionId, channel_ids: g.channelIds }))),
+        };
+        const r = await apiCall('users.channelSections.channels.bulkUpdate', params);
+        if (!r || r.ok === false) {
+          failed++; log('move ' + m.insertChannelIds.length + ' channels into "' + m.sectionName + '" FAILED: ' + ((r && r.error) || 'unknown'));
+          continue;
+        }
+        moved += m.insertChannelIds.length;
+        log('moved ' + m.insertChannelIds.length + ' channels into "' + m.sectionName + '"');
+      }
+
+      const summary = 'Created ' + created + ' sections, moved ' + moved + ' channels, skipped '
+        + plan.counts.skip + (failed ? ', FAILED ' + failed + ' operations (see log)' : '') + '.';
+      if (failed) overlay.fail(summary); else overlay.done(summary);
+    } catch (e) {
+      log('FAILED: ' + ((e && e.message) || e));
+      if (e && e.name === 'AbortError') overlay.done('Import canceled. Changes applied before canceling remain.');
+      else overlay.fail(String((e && e.message) || e));
+    } finally {
+      exportInProgress = false;
+    }
+  });
+  // =================== end channel sections import ===================
   // =================== end channel list export ===================
 
   if (document.readyState === 'loading') {
