@@ -630,6 +630,23 @@ test('parseSectionsDoc rejects malformed sections and channel ids', () => {
   assert.throws(() => core.parseSectionsDoc(JSON.stringify(notArray), 'T123'), /sections/);
 });
 
+test('parseSectionsDoc rejects duplicate section names within the file', () => {
+  const dup = validSectionsDoc();
+  dup.sections = [
+    { name: 'Infra', emoji: null, channels: [{ id: 'C0AAA', name: 'backbone' }] },
+    { name: 'Team', emoji: null, channels: [{ id: 'C0BBB', name: 'other' }] },
+    { name: 'Infra', emoji: null, channels: [{ id: 'C0CCC', name: 'again' }] },
+  ];
+  assert.throws(() => core.parseSectionsDoc(JSON.stringify(dup), 'T123'), /duplicates the name/);
+
+  const whitespaceDup = validSectionsDoc();
+  whitespaceDup.sections = [
+    { name: 'Infra', emoji: null, channels: [{ id: 'C0AAA', name: 'backbone' }] },
+    { name: ' Infra ', emoji: null, channels: [{ id: 'C0BBB', name: 'other' }] },
+  ];
+  assert.throws(() => core.parseSectionsDoc(JSON.stringify(whitespaceDup), 'T123'), /duplicates the name/);
+});
+
 const PLAN_CURRENT = () => [
   { id: 'S1', name: 'Infra', emoji: 'wrench', type: 'standard', channelIds: ['C1'] },
   { id: 'S2', name: 'Team', emoji: null, type: 'standard', channelIds: ['C2'] },
@@ -695,6 +712,22 @@ test('computeSectionsImportPlan: skips unknown channels and duplicates (first wi
   assert.equal(plan.skips.length, 2);
   assert.match(plan.skips.find((s) => s.channelId === 'C0NOPE').reason, /not a member|unknown/i);
   assert.match(plan.skips.find((s) => s.channelId === 'C4').reason, /more than once/);
+});
+
+test('computeSectionsImportPlan: current sections with a shared name are never a move source between each other', () => {
+  const current = [
+    { id: 'S1', name: 'Dup', type: 'standard', channelIds: ['C1'] },
+    { id: 'S2', name: 'Dup', type: 'standard', channelIds: ['C2'] },
+  ];
+  const members = [{ id: 'C1', name: 'one' }, { id: 'C2', name: 'two' }];
+  const doc = { sections: [
+    { name: 'Dup', emoji: null, channels: [{ id: 'C1' }, { id: 'C2' }] },
+  ]};
+  const plan = core.computeSectionsImportPlan(doc, current, members);
+  assert.deepEqual(plan.create, []);
+  assert.deepEqual(plan.moves, []);
+  assert.equal(plan.skips.length, 2);
+  for (const skip of plan.skips) assert.match(skip.reason, /already in/);
 });
 
 test('computeSectionsImportPlan: channel only known from a section (e.g. a DM) is movable; starred is never a remove source', () => {

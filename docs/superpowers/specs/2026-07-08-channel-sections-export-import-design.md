@@ -174,12 +174,15 @@ channels", "Saving file".
 4. **Compute plan:** `exportCore.computeSectionsImportPlan(doc, currentSections,
    memberChannels)` (new pure function) returns:
    - `create`: sections in the file with no existing standard section of the **exact same
-     name** (first name match wins if Slack somehow holds duplicates).
+     name** (first name match wins if Slack somehow holds duplicates). Duplicate section
+     names within the file itself are rejected as a validation error at parse time, since
+     they would produce two ambiguous `create` entries for the same name.
    - `moves`: per target section, the channel IDs to insert, each with the source section
      ID to remove from (or none if currently unsectioned).
    - `skips`: channels with reasons - not a member of the channel, already in the target
-     section (idempotent no-op), duplicate channel entry in the file (first placement
-     wins).
+     section or in a current section with the same name as the target (idempotent no-op;
+     the file cannot tell same-named sections apart, so a channel is never moved between
+     them), duplicate channel entry in the file (first placement wins).
 5. **Confirm:** the overlay shows the plan summary ("create 3 sections, move 47 channels,
    skip 2 - see log") with **Apply / Cancel** buttons. No mutation happens before Apply.
    Skip reasons are listed in the overlay log before confirmation.

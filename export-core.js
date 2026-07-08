@@ -416,6 +416,7 @@ const SECTIONS_EXPORT_INSTRUCTIONS = [
   "Import is additive: it creates missing sections and moves the listed channels into them. It never deletes sections or removes channels from sections. Channels left in 'unsectioned' are ignored on import.",
   "Each channel id should appear at most once across all sections; if it appears more than once, the first placement wins.",
   "Do not modify 'format', 'version', 'workspace', or 'schema'.",
+  "Section 'name' values must be unique within the file.",
 ];
 
 const SECTIONS_EXPORT_SCHEMA = {
@@ -527,6 +528,7 @@ function parseSectionsDoc(text, currentTeamId) {
   if (!Array.isArray(doc.sections)) {
     throw new Error('Missing "sections" array.');
   }
+  const seenNames = new Map(); // trimmed name -> index of first occurrence
   doc.sections.forEach((s, i) => {
     const where = 'sections[' + i + ']';
     if (!s || typeof s !== 'object' || Array.isArray(s)) throw new Error(where + ' is not an object.');
@@ -539,6 +541,16 @@ function parseSectionsDoc(text, currentTeamId) {
           + (c && typeof c.id === 'string' ? ': "' + c.id + '"' : '.'));
       }
     });
+    // Duplicate (trimmed) names within the file are rejected here rather than
+    // silently merged: two "create" entries with the same name would be
+    // ambiguous downstream, since the executor resolves a newly created
+    // section's id by looking up its name.
+    const trimmedName = s.name.trim();
+    if (seenNames.has(trimmedName)) {
+      const firstIndex = seenNames.get(trimmedName);
+      throw new Error(where + ' ("' + s.name + '") duplicates the name of sections[' + firstIndex + '].');
+    }
+    seenNames.set(trimmedName, i);
   });
   return doc;
 }
@@ -552,6 +564,12 @@ function computeSectionsImportPlan(doc, currentSections, memberChannels) {
   for (const s of standard) {
     if (!sectionIdByName.has(s.name)) sectionIdByName.set(s.name, s.id);
   }
+  // standard section id -> its trimmed name. The file cannot distinguish
+  // between two current sections that share a name (there is nothing in the
+  // doc to tell them apart), so a channel already sitting in a same-named
+  // section must never be planned to move to the other one - that would
+  // "move" it into a section indistinguishable from the one it is already in.
+  const nameById = new Map(standard.map((s) => [s.id, s.name.trim()]));
   // channel id -> the standard section it currently sits in (remove source)
   const currentSectionByChannel = new Map();
   for (const s of standard) {
@@ -585,7 +603,10 @@ function computeSectionsImportPlan(doc, currentSections, memberChannels) {
         continue;
       }
       const from = currentSectionByChannel.get(ch.id) || null;
-      if (targetId && from === targetId) {
+      // Same-named current section counts as already-in-target: the file has
+      // no way to tell two same-named sections apart, so we must never move a
+      // channel between them (see nameById comment above).
+      if (targetId && from && (from === targetId || nameById.get(from) === name)) {
         skips.push({ channelId: ch.id, name: ch.name || null, reason: 'already in "' + name + '"' });
         continue;
       }
