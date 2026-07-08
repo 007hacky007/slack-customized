@@ -46,6 +46,7 @@ endpoints sync to all of the user's Slack clients, exactly as if done in the off
     "Channels are matched by 'id' on import; 'name' is informational only. Do not invent channel ids.",
     "Import is additive: it creates missing sections and moves the listed channels into them. It never deletes sections or removes channels from sections. Channels left in 'unsectioned' are ignored on import.",
     "Each channel id should appear at most once across all sections; if it appears more than once, the first placement wins.",
+    "Section 'name' values must be unique within the file.",
     "Do not modify 'format', 'version', 'workspace', or 'schema'."
   ],
   "schema": {
