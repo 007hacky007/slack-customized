@@ -1819,6 +1819,65 @@ ipcMain.handle('slack-autocomplete:open-import', async (event) => {
   return { ok: true, path: filePath, content };
 });
 
+// --- Last-seen presence IPC ---
+let lastSeenCurrentSub = null; // { clientIds, injectedIds, at }
+
+ipcMain.on('slack-autocomplete:last-seen:event', (event, payload = {}) => {
+  if (!isSlackSender(event)) return;
+  const now = new Date().toISOString();
+  try {
+    if (payload.kind === 'sub') {
+      lastSeenCore.recordSubscription(lastSeenStore, payload.clientIds || [], payload.injectedIds || [], now);
+      lastSeenCurrentSub = { clientIds: payload.clientIds || [], injectedIds: payload.injectedIds || [], at: now };
+      scheduleLastSeenSave();
+    } else if (payload.kind === 'change') {
+      const res = lastSeenCore.applyPresenceEvent(
+        lastSeenStore, { ids: payload.ids, user: payload.user, presence: payload.presence }, now);
+      appendTransitions(res.transitions);
+      scheduleLastSeenSave();
+    }
+  } catch (err) { console.warn('last-seen event error', err); }
+});
+
+ipcMain.handle('slack-autocomplete:last-seen:snapshot', (event) => {
+  if (!isSlackSender(event)) throw new Error('last-seen rejected: untrusted sender');
+  return {
+    users: lastSeenStore.users,
+    subscriptionLog: lastSeenStore.subscriptionLog,
+    currentSubscription: lastSeenCurrentSub,
+    watchlist: lastSeenWatchlist
+  };
+});
+
+ipcMain.handle('slack-autocomplete:last-seen:recent-transitions', (event, payload = {}) => {
+  if (!isSlackSender(event)) throw new Error('last-seen rejected: untrusted sender');
+  const limit = Math.max(1, Math.min(500, Number(payload.limit) || 50));
+  let text = '';
+  try { text = fs.readFileSync(lastSeenTransitionsPath(), 'utf8'); }
+  catch (err) { return []; }
+  const lines = text.split('\n').filter((l) => l.trim());
+  const out = [];
+  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+    try { out.push(JSON.parse(lines[i])); } catch (e) { /* skip bad line */ }
+  }
+  return out;
+});
+
+ipcMain.handle('slack-autocomplete:last-seen:watchlist', (event) => {
+  if (!isSlackSender(event)) throw new Error('last-seen rejected: untrusted sender');
+  return lastSeenWatchlist;
+});
+
+ipcMain.handle('slack-autocomplete:last-seen:open-file', async (event, payload = {}) => {
+  if (!isSlackSender(event)) throw new Error('last-seen rejected: untrusted sender');
+  let target;
+  if (payload.which === 'watchlist') { ensureWatchlistFile(); target = lastSeenWatchlistPath(); }
+  else if (payload.which === 'transitions') target = lastSeenTransitionsPath();
+  else target = lastSeenStorePath();
+  const err = await shell.openPath(target);
+  return { ok: !err, error: err || null };
+});
+
 ipcMain.handle('slack-autocomplete:open-external', async (_event, targetUrl) => {
   if (typeof targetUrl !== 'string' || !targetUrl.trim()) {
     return { status: 'error', reason: 'invalid-url' };
