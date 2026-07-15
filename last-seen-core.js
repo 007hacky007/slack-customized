@@ -150,6 +150,25 @@ function applyWatchlistUpdate(users, change) {
   return { users: current, changed: false };
 }
 
+function filterRoster(roster, query, max) {
+  const q = String(query || '').trim().toLowerCase();
+  const limit = max || 10;
+  const out = [];
+  if (!Array.isArray(roster) || q.length < 2) return out;
+  for (const e of roster) {
+    if (!e || typeof e !== 'object') continue;
+    const fields = [e.name, e.real_name, e.display_name];
+    for (const f of fields) {
+      if (typeof f === 'string' && f.toLowerCase().indexOf(q) !== -1) {
+        out.push(e);
+        break;
+      }
+    }
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 module.exports = {
   WATCHLIST_CAP,
   SUB_LOG_MAX,
@@ -162,5 +181,6 @@ module.exports = {
   applyPresenceEvent,
   formatTransitionLine,
   describeLastSeen,
-  applyWatchlistUpdate
+  applyWatchlistUpdate,
+  filterRoster
 };

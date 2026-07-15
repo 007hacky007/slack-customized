@@ -227,3 +227,33 @@ test('applyWatchlistUpdate handles null/garbage change', () => {
   assert.equal(core.applyWatchlistUpdate(['U111AAA'], null).changed, false);
   assert.equal(core.applyWatchlistUpdate(['U111AAA'], {}).changed, false);
 });
+
+const ROSTER = [
+  { id: 'U1AAA11', name: 'jkrpes', real_name: 'Jan Krpes', display_name: 'honza' },
+  { id: 'U2BBB22', name: 'jnovak', real_name: 'Jan Novak', display_name: '' },
+  { id: 'U3CCC33', name: 'asmith', real_name: 'Alice Smith', display_name: 'ali' }
+];
+
+test('filterRoster matches case-insensitively on all name fields', () => {
+  assert.deepEqual(core.filterRoster(ROSTER, 'JAN').map((e) => e.id), ['U1AAA11', 'U2BBB22']);
+  assert.deepEqual(core.filterRoster(ROSTER, 'honza').map((e) => e.id), ['U1AAA11']);
+  assert.deepEqual(core.filterRoster(ROSTER, 'smith').map((e) => e.id), ['U3CCC33']);
+});
+
+test('filterRoster returns [] for short or empty queries', () => {
+  assert.deepEqual(core.filterRoster(ROSTER, 'j'), []);
+  assert.deepEqual(core.filterRoster(ROSTER, '  '), []);
+  assert.deepEqual(core.filterRoster(ROSTER, null), []);
+});
+
+test('filterRoster caps results at max', () => {
+  const big = [];
+  for (let i = 0; i < 30; i++) big.push({ id: 'U' + i, name: 'samename' + i });
+  assert.equal(core.filterRoster(big, 'samename').length, 10);
+  assert.equal(core.filterRoster(big, 'samename', 3).length, 3);
+});
+
+test('filterRoster tolerates garbage entries', () => {
+  assert.deepEqual(core.filterRoster([null, 42, { id: 'U1', name: null }], 'xx'), []);
+  assert.deepEqual(core.filterRoster('not-an-array', 'xx'), []);
+});
