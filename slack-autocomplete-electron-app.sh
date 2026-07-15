@@ -781,6 +781,40 @@ function installApplicationMenu() {
             }
           ]
         },
+        {
+          label: 'Last Seen',
+          submenu: [
+            {
+              label: 'Show Last Seen Panel',
+              click: (_item, focusedWindow) => {
+                const w = focusedWindow || BrowserWindow.getFocusedWindow();
+                if (w) w.webContents.send('slack-autocomplete:last-seen:show-panel');
+              }
+            },
+            {
+              label: 'Export Last Seen...',
+              click: (_item, focusedWindow) => {
+                const w = focusedWindow || BrowserWindow.getFocusedWindow();
+                if (w) w.webContents.send('slack-autocomplete:last-seen:export');
+              }
+            },
+            { type: 'separator' },
+            {
+              label: 'Open Watchlist',
+              click: (_item, focusedWindow) => {
+                const w = focusedWindow || BrowserWindow.getFocusedWindow();
+                if (w) w.webContents.send('slack-autocomplete:last-seen:open', { which: 'watchlist' });
+              }
+            },
+            {
+              label: 'Open Transition Log',
+              click: (_item, focusedWindow) => {
+                const w = focusedWindow || BrowserWindow.getFocusedWindow();
+                if (w) w.webContents.send('slack-autocomplete:last-seen:open', { which: 'transitions' });
+              }
+            }
+          ]
+        },
         { type: 'separator' },
         IS_MAC ? { role: 'close' } : { role: 'quit' }
       ]
