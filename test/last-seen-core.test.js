@@ -39,3 +39,52 @@ test('parseWatchlist treats missing users array as empty', () => {
   assert.equal(r.ok, true);
   assert.deepEqual(r.users, []);
 });
+
+test('mergePresenceSub passes through non-JSON frames', () => {
+  const r = core.mergePresenceSub('not json', ['U123ABC']);
+  assert.equal(r.changed, false);
+  assert.equal(r.frame, 'not json');
+  assert.equal(r.clientIds, null);
+});
+
+test('mergePresenceSub passes through non-presence_sub frames', () => {
+  const f = JSON.stringify({ type: 'ping', id: 1 });
+  const r = core.mergePresenceSub(f, ['U123ABC']);
+  assert.equal(r.changed, false);
+  assert.equal(r.frame, f);
+});
+
+test('mergePresenceSub merges watchlist ids not already present', () => {
+  const f = JSON.stringify({ type: 'presence_sub', ids: ['U111AAA'] });
+  const r = core.mergePresenceSub(f, ['U222BBB', 'U111AAA']);
+  assert.equal(r.changed, true);
+  assert.deepEqual(r.clientIds, ['U111AAA']);
+  assert.deepEqual(r.injectedIds, ['U222BBB']);
+  assert.deepEqual(JSON.parse(r.frame).ids, ['U111AAA', 'U222BBB']);
+  assert.equal(JSON.parse(r.frame).type, 'presence_sub');
+});
+
+test('mergePresenceSub is a no-op when watchlist adds nothing', () => {
+  const f = JSON.stringify({ type: 'presence_sub', ids: ['U111AAA'] });
+  const r = core.mergePresenceSub(f, ['U111AAA']);
+  assert.equal(r.changed, false);
+  assert.equal(r.frame, f);
+  assert.deepEqual(r.injectedIds, []);
+});
+
+test('mergePresenceSub caps injected ids at WATCHLIST_CAP', () => {
+  const watch = [];
+  for (let i = 0; i < core.WATCHLIST_CAP + 20; i++) {
+    watch.push('U' + String(i).padStart(5, '0') + 'Z');
+  }
+  const f = JSON.stringify({ type: 'presence_sub', ids: [] });
+  const r = core.mergePresenceSub(f, watch);
+  assert.equal(r.injectedIds.length, core.WATCHLIST_CAP);
+  assert.equal(JSON.parse(r.frame).ids.length, core.WATCHLIST_CAP);
+});
+
+test('mergePresenceSub preserves other frame fields', () => {
+  const f = JSON.stringify({ type: 'presence_sub', ids: ['U111AAA'], extra: 'keep' });
+  const r = core.mergePresenceSub(f, ['U222BBB']);
+  assert.equal(JSON.parse(r.frame).extra, 'keep');
+});

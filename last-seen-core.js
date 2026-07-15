@@ -39,11 +39,35 @@ function parseWatchlist(raw) {
   return { ok: true, users: dedupeValidIds(obj.users), error: null };
 }
 
+function mergePresenceSub(frameString, watchlistIds) {
+  const passthrough = { changed: false, frame: frameString, clientIds: null, injectedIds: null };
+  if (typeof frameString !== 'string') return passthrough;
+  let obj;
+  try { obj = JSON.parse(frameString); }
+  catch (e) { return passthrough; }
+  if (!obj || typeof obj !== 'object' || obj.type !== 'presence_sub') return passthrough;
+
+  const clientIds = dedupeValidIds(obj.ids);
+  const clientSet = new Set(clientIds);
+  const injectedIds = [];
+  for (const id of dedupeValidIds(watchlistIds)) {
+    if (clientSet.has(id)) continue;
+    injectedIds.push(id);
+    if (injectedIds.length >= WATCHLIST_CAP) break;
+  }
+  if (injectedIds.length === 0) {
+    return { changed: false, frame: frameString, clientIds, injectedIds };
+  }
+  const merged = Object.assign({}, obj, { ids: clientIds.concat(injectedIds) });
+  return { changed: true, frame: JSON.stringify(merged), clientIds, injectedIds };
+}
+
 module.exports = {
   WATCHLIST_CAP,
   SUB_LOG_MAX,
   USER_ID_RE,
   emptyStore,
   dedupeValidIds,
-  parseWatchlist
+  parseWatchlist,
+  mergePresenceSub
 };
