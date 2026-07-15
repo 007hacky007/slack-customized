@@ -132,6 +132,24 @@ function describeLastSeen(entry) {
   return { state, lastOnlineAt: (entry && entry.lastActiveAt) || null };
 }
 
+function applyWatchlistUpdate(users, change) {
+  const current = dedupeValidIds(users);
+  if (!change || typeof change !== 'object') return { users: current, changed: false };
+  if (typeof change.add === 'string') {
+    const id = change.add.trim();
+    if (USER_ID_RE.test(id) && current.indexOf(id) === -1) {
+      return { users: current.concat([id]), changed: true };
+    }
+    return { users: current, changed: false };
+  }
+  if (typeof change.remove === 'string') {
+    const id = change.remove.trim();
+    const next = current.filter((u) => u !== id);
+    return { users: next, changed: next.length !== current.length };
+  }
+  return { users: current, changed: false };
+}
+
 module.exports = {
   WATCHLIST_CAP,
   SUB_LOG_MAX,
@@ -143,5 +161,6 @@ module.exports = {
   recordSubscription,
   applyPresenceEvent,
   formatTransitionLine,
-  describeLastSeen
+  describeLastSeen,
+  applyWatchlistUpdate
 };

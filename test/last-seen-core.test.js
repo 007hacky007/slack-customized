@@ -186,3 +186,44 @@ test('describeLastSeen reports online vs offline', () => {
     core.describeLastSeen({ lastPresence: 'away', lastActiveAt: '2026-07-15T08:00:00.000Z' }),
     { state: 'offline', lastOnlineAt: '2026-07-15T08:00:00.000Z' });
 });
+
+test('applyWatchlistUpdate adds a valid new id', () => {
+  const r = core.applyWatchlistUpdate(['U111AAA'], { add: 'U222BBB' });
+  assert.equal(r.changed, true);
+  assert.deepEqual(r.users, ['U111AAA', 'U222BBB']);
+});
+
+test('applyWatchlistUpdate no-ops on duplicate add', () => {
+  const r = core.applyWatchlistUpdate(['U111AAA'], { add: 'U111AAA' });
+  assert.equal(r.changed, false);
+  assert.deepEqual(r.users, ['U111AAA']);
+});
+
+test('applyWatchlistUpdate rejects invalid add ids', () => {
+  const r = core.applyWatchlistUpdate(['U111AAA'], { add: 'not-an-id' });
+  assert.equal(r.changed, false);
+  assert.deepEqual(r.users, ['U111AAA']);
+});
+
+test('applyWatchlistUpdate removes an existing id', () => {
+  const r = core.applyWatchlistUpdate(['U111AAA', 'U222BBB'], { remove: 'U111AAA' });
+  assert.equal(r.changed, true);
+  assert.deepEqual(r.users, ['U222BBB']);
+});
+
+test('applyWatchlistUpdate no-ops removing a missing id', () => {
+  const r = core.applyWatchlistUpdate(['U111AAA'], { remove: 'U999ZZZ' });
+  assert.equal(r.changed, false);
+  assert.deepEqual(r.users, ['U111AAA']);
+});
+
+test('applyWatchlistUpdate does not mutate the input array', () => {
+  const input = ['U111AAA'];
+  core.applyWatchlistUpdate(input, { add: 'U222BBB' });
+  assert.deepEqual(input, ['U111AAA']);
+});
+
+test('applyWatchlistUpdate handles null/garbage change', () => {
+  assert.equal(core.applyWatchlistUpdate(['U111AAA'], null).changed, false);
+  assert.equal(core.applyWatchlistUpdate(['U111AAA'], {}).changed, false);
+});
