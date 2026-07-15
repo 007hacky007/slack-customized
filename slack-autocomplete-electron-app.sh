@@ -4354,6 +4354,194 @@ cat > preload.js <<'EOF'
       .catch(() => {});
   }
 
+  // Resolve user ids to display names via the existing rate-limited api-call
+  // bridge, cached for the window's lifetime. Used by the Last Seen panel/export.
+  const lastSeenNameCache = {};
+  async function resolveUserNames(ids) {
+    const missing = ids.filter((id) => !(id in lastSeenNameCache));
+    if (missing.length) {
+      let cfg;
+      try { cfg = getExportConfig(function () {}, { requireChannel: false }); }
+      catch (e) { for (const id of missing) lastSeenNameCache[id] = id; return lastSeenNameCache; }
+      const apiCall = createApiCall(cfg, null, function () {});
+      for (const id of missing) {
+        try {
+          const resp = await apiCall('users.info', { user: id });
+          if (resp && resp.ok && resp.user) {
+            const e = exportCore.buildUserEntry(resp.user);
+            lastSeenNameCache[id] = e.name || id;
+          } else { lastSeenNameCache[id] = id; }
+        } catch (e) { lastSeenNameCache[id] = id; }
+      }
+    }
+    return lastSeenNameCache;
+  }
+
+  // ---------------- Last Seen viewer panel ----------------
+  function setupLastSeenPanel() {
+    if (!ipcRenderer) return;
+    let root = null, visible = false;
+
+    function fmtTime(iso) {
+      if (!iso) return '-';
+      try { return new Date(iso).toLocaleString(); } catch (e) { return iso; }
+    }
+
+    function ensurePanel() {
+      if (root) return;
+      root = document.createElement('div');
+      root.id = 'slack-autocomplete-last-seen-panel';
+      root.style.cssText = 'position:fixed;top:44px;right:8px;width:380px;max-height:80vh;z-index:2147483000;'
+        + 'background:#1d1c1d;color:#fff;border:1px solid #3a393a;border-radius:10px;'
+        + 'box-shadow:0 10px 40px rgba(0,0,0,0.5);display:none;flex-direction:column;'
+        + 'font-family:-apple-system,Segoe UI,sans-serif;overflow:hidden;';
+      const header = document.createElement('div');
+      header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid #3a393a;';
+      const title = document.createElement('div');
+      title.textContent = 'Last Seen';
+      title.style.cssText = 'font-weight:700;font-size:14px;';
+      const closeBtn = document.createElement('button');
+      closeBtn.textContent = 'X';
+      closeBtn.style.cssText = 'background:none;border:0;color:#9a9a9a;cursor:pointer;font-size:12px;';
+      closeBtn.addEventListener('click', () => toggle(false));
+      header.appendChild(title); header.appendChild(closeBtn);
+
+      const warn = document.createElement('div');
+      warn.style.cssText = 'padding:8px 12px;background:#3d2f00;color:#f5d16a;font-size:11px;line-height:1.4;border-bottom:1px solid #3a393a;';
+      warn.textContent = 'Presence is derived from live events: Slack throttles them (up to ~1 min lag), '
+        + 'there is no backfill (tracking starts when the app does), and an "away" reading right after '
+        + 'tracking a user only means they were already away, not that they just went offline.';
+
+      const body = document.createElement('div');
+      body.id = 'slack-autocomplete-last-seen-body';
+      body.style.cssText = 'overflow:auto;padding:8px 12px;font-size:12px;';
+
+      root.appendChild(header); root.appendChild(warn); root.appendChild(body);
+      (document.body || document.documentElement).appendChild(root);
+    }
+
+    function section(titleText) {
+      const h = document.createElement('div');
+      h.textContent = titleText;
+      h.style.cssText = 'font-weight:700;margin:10px 0 4px;color:#cfcfcf;';
+      return h;
+    }
+
+    async function render() {
+      ensurePanel();
+      const body = root.querySelector('#slack-autocomplete-last-seen-body');
+      body.textContent = 'Loading...';
+      let snap, recent;
+      try {
+        snap = await ipcRenderer.invoke('slack-autocomplete:last-seen:snapshot');
+        recent = await ipcRenderer.invoke('slack-autocomplete:last-seen:recent-transitions', { limit: 30 });
+      } catch (e) { body.textContent = 'Failed to load last-seen data.'; return; }
+
+      const userIds = Object.keys(snap.users || {});
+      const sub = snap.currentSubscription || { clientIds: [], injectedIds: [] };
+      const allIds = Array.from(new Set(userIds
+        .concat(sub.clientIds || []).concat(sub.injectedIds || [])
+        .concat((recent || []).map((t) => t.user))));
+      const names = await resolveUserNames(allIds);
+      const nameOf = (id) => (names[id] || id);
+      const watchSet = new Set(snap.watchlist || []);
+
+      body.textContent = '';
+
+      // Tracked users, most recently online first.
+      body.appendChild(section('Tracked users (' + userIds.length + ')'));
+      const rows = userIds.map((id) => {
+        const d = lastSeenCore.describeLastSeen(snap.users[id]);
+        return { id, d, entry: snap.users[id] };
+      }).sort((a, b) => String(b.d.lastOnlineAt || '').localeCompare(String(a.d.lastOnlineAt || '')));
+      if (!rows.length) { const p = document.createElement('div'); p.textContent = 'No presence recorded yet.'; body.appendChild(p); }
+      for (const r of rows) {
+        const line = document.createElement('div');
+        line.style.cssText = 'padding:3px 0;border-bottom:1px solid #2a292a;';
+        const online = r.d.state === 'online';
+        const lastOnline = online ? 'online now' : fmtTime(r.d.lastOnlineAt);
+        line.textContent = (online ? '● ' : '○ ') + nameOf(r.id)
+          + (watchSet.has(r.id) ? '  [watch]' : '')
+          + '  -  ' + lastOnline;
+        line.style.color = online ? '#2bac76' : '#cccccc';
+        body.appendChild(line);
+      }
+
+      // Live subscription view.
+      body.appendChild(section('Currently subscribed'));
+      const subBox = document.createElement('div');
+      const cIds = (sub.clientIds || []).map(nameOf).join(', ') || '(none)';
+      const iIds = (sub.injectedIds || []).map(nameOf).join(', ') || '(none)';
+      const cLine = document.createElement('div'); cLine.textContent = 'By Slack client: ' + cIds;
+      const iLine = document.createElement('div'); iLine.style.color = '#7aa7ff'; iLine.textContent = 'Injected from watchlist: ' + iIds;
+      subBox.appendChild(cLine); subBox.appendChild(iLine);
+      body.appendChild(subBox);
+
+      // Recent transitions.
+      body.appendChild(section('Recent transitions'));
+      if (!recent || !recent.length) { const p = document.createElement('div'); p.textContent = '(none logged yet)'; body.appendChild(p); }
+      for (const t of (recent || [])) {
+        const line = document.createElement('div');
+        line.style.cssText = 'padding:2px 0;color:#bdbdbd;';
+        line.textContent = fmtTime(t.at) + '  ' + nameOf(t.user) + '  ' + t.presence + (t.baseline ? '  (baseline)' : '');
+        body.appendChild(line);
+      }
+    }
+
+    function toggle(show) {
+      ensurePanel();
+      visible = (show === undefined) ? !visible : show;
+      root.style.display = visible ? 'flex' : 'none';
+      if (visible) render();
+    }
+
+    ipcRenderer.on('slack-autocomplete:last-seen:show-panel', () => toggle());
+  }
+
+  // ---------------- Last Seen export ----------------
+  async function runLastSeenExport() {
+    const overlay = createExportOverlay('Exporting last-seen data...');
+    let saveToken = null;
+    try {
+      overlay.setPhase('Reading data...');
+      const snap = await ipcRenderer.invoke('slack-autocomplete:last-seen:snapshot');
+      const userIds = Object.keys(snap.users || {});
+      overlay.setPhase('Resolving names...');
+      const names = await resolveUserNames(userIds);
+      const users = {};
+      for (const id of userIds) {
+        users[id] = Object.assign({ id, name: names[id] || id }, snap.users[id]);
+      }
+      const doc = {
+        format: 'slack-last-seen-export',
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        users,
+        watchlist: snap.watchlist || [],
+        currentSubscription: snap.currentSubscription || null
+      };
+      overlay.setPhase('Saving file...');
+      const suggested = 'slack-last-seen-' + exportTsStamp() + '.json';
+      const begin = await ipcRenderer.invoke('slack-autocomplete:save-export:begin', { suggestedName: suggested });
+      if (begin && begin.canceled) { overlay.destroy(); return; }
+      saveToken = begin.token;
+      await ipcRenderer.invoke('slack-autocomplete:save-export:write', { token: saveToken, chunk: JSON.stringify(doc, null, 2) });
+      const res = await ipcRenderer.invoke('slack-autocomplete:save-export:commit', { token: saveToken });
+      overlay.done('Saved to ' + res.path);
+    } catch (e) {
+      if (saveToken) { try { await ipcRenderer.invoke('slack-autocomplete:save-export:abort', { token: saveToken }); } catch (e2) { /* ignore */ } }
+      overlay.fail(String((e && e.message) || e));
+    }
+  }
+
+  function setupLastSeenMenuActions() {
+    if (!ipcRenderer) return;
+    ipcRenderer.on('slack-autocomplete:last-seen:export', () => { runLastSeenExport(); });
+    ipcRenderer.on('slack-autocomplete:last-seen:open', (_event, payload) => {
+      ipcRenderer.invoke('slack-autocomplete:last-seen:open-file', { which: (payload && payload.which) || 'store' }).catch(() => {});
+    });
+  }
+
   function init() {
     installPresenceTap();
     installPresenceBridge();
@@ -4376,6 +4564,8 @@ cat > preload.js <<'EOF'
     });
     setupBadgeUpdater();
     setupDownloadsPanel();
+    setupLastSeenPanel();
+    setupLastSeenMenuActions();
     setupTeamsReporter();
     installNativeNotificationBridge();
     installIdleDetector();
