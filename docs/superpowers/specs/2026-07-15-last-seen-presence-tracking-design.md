@@ -48,9 +48,15 @@ even subscribed to a given user at a given time.
   local; nothing leaves the machine.
 - **Watchlist: hand-edited JSON file** in `userData`, opened via a menu item, hot-reloaded
   on change. No in-app editor UI (YAGNI).
-- **Names resolved only on export**, reusing the existing preload `api-call` bridge and
-  rate-limited `users.info` pattern from the channel export features. The live store keeps
-  ids only.
+- **Accessible transition log** (spec review feedback): every presence transition is
+  appended to a plain JSONL file the user can open and grep, in addition to the derived
+  per-user state.
+- **Viewer: in-page panel** following the downloads-panel pattern (preload-rendered
+  fixed pane, data over IPC), showing per-user last-seen state, recent transitions, the
+  live subscription list, and a warning about presence event semantics.
+- **Names resolved in the viewer and on export**, reusing the existing preload
+  `api-call` bridge and rate-limited `users.info` pattern from the channel export
+  features (with an in-memory cache). The live store keeps ids only.
 
 ## Architecture
 
@@ -72,6 +78,27 @@ Injected by the preload into the page's main world before Slack boots. Wraps
   change, if an instrumented socket is open and a previous client `presence_sub` was
   seen, the tap proactively re-sends the merged subscription so new watchlist entries
   take effect without waiting for the client's next re-subscribe.
+
+### 1b. How the injected watchlist coexists with Slack's own subscriptions
+
+Slack's client treats the subscription list as full-replace: every `presence_sub` frame
+it sends overwrites the server-side list with exactly the ids in that frame. The tap
+therefore never needs to "defend" its ids against the client:
+
+- The rewrite happens at the socket boundary, inside `send()`. The client builds its
+  frame normally (it never sees our modification), and every frame - initial subscribe,
+  every UI-driven re-subscribe, every reconnect's first subscribe - gets the watchlist
+  merged in at transmit time. The server-side subscription is therefore always
+  `client ids UNION watchlist`, no matter how often Slack replaces its list.
+- There is no state where Slack "wins" and drops watchlist ids: a client override is
+  just another outgoing frame, and it gets rewritten like all the others. The only gap
+  is between watchlist-file edit and the next outgoing frame, which the proactive
+  re-send (previous client ids + new watchlist) closes immediately.
+- Reconnects create a fresh socket; the wrapper instruments it like the first one, so
+  coverage survives reconnects.
+- Failure mode: if a rewrite ever throws, the original frame goes out unmodified - the
+  watchlist ids drop off until the next `presence_sub`, and Slack's own behavior is
+  never affected.
 
 ### 2. Preload bridge (isolated world)
 
@@ -110,7 +137,24 @@ into the main world. Also hosts the name-resolving export flow (see Surface).
   subscribed to user X at time T" - the evidence needed for the bug report.
 - Writes are debounced (2 s) and atomic (write temp file, rename). Events from multiple
   windows (pop-outs have their own sockets) are idempotent updates, so duplicates are
-  harmless.
+  harmless (same-timestamp same-state repeats are skipped for the transition log).
+
+### 3b. Transition log
+
+`userData/last-seen-transitions.jsonl` - one line appended per observed transition:
+
+```json
+{"at":"2026-07-15T09:40:00.000Z","user":"U0123ABC","presence":"away","baseline":false}
+```
+
+- `baseline: true` marks the initial presence reading Slack pushes right after an id is
+  newly subscribed (best-effort: the id was in the most recent `presence_sub`'s
+  newly-added set and this is its first event since). Baseline `away` means "was already
+  away when tracking began", not "went offline now".
+- Plain JSONL so it is greppable and script-friendly; rotated at 5 MB to a single `.1`
+  suffix. Presence transitions are low-volume (at most a few per tracked user per day),
+  so rotation is a safety valve, not an expected event.
+- The viewer panel reads the tail of this file for its "recent transitions" list.
 
 ### 4. Watchlist file
 
@@ -120,16 +164,36 @@ on window focus as fallback), validates, and broadcasts to all windows. Invalid 
 is logged and treated as empty. Injected ids are capped at 100 to keep merged
 `presence_sub` frames well within sizes Slack accepts.
 
-### 5. Surface (menu)
+### 5. Surface: viewer panel plus menu
 
-Three items alongside the existing export features:
+**Viewer panel** - the primary surface. An in-page fixed pane rendered by the preload,
+same technique as the existing downloads panel (`position:fixed` pane, high z-index,
+data fetched from main via `ipcRenderer.invoke`, user names resolved through the
+existing rate-limited `api-call` bridge with an in-memory cache). Sections, top to
+bottom:
 
+1. **Warning banner** (always visible): presence events are throttled server-side and
+   can lag by up to about a minute; there is no backfill (tracking starts when the app
+   does); a baseline `away` reading means "already away when tracking began", not "just
+   went offline".
+2. **Tracked users table**: display name (falls back to id until resolved), current
+   presence, "last online" (per the semantics above, "online now" while active),
+   first-tracked date. Sorted by most recently online. Watchlist members are marked.
+3. **Live subscription view**: the ids from the most recent `presence_sub`, with names,
+   split into "subscribed by Slack client" and "injected from watchlist" - this shows
+   at a glance which users presence is currently flowing for and why.
+4. **Recent transitions**: tail of the transition log (most recent first), with names
+   and baseline markers.
+
+**Menu** - a `Last Seen` submenu under `File`, next to `Channel Sections`:
+
+- **Show Last Seen Panel** - toggles the viewer panel in the focused window.
 - **Export Last Seen...** - sends the store to the focused window's preload, which
-  resolves display names via the existing rate-limited `api-call` bridge (`users.info`,
-  cached) and saves an enriched JSON through the existing save-dialog flow.
-- **Open Last Seen Watchlist** - opens the watchlist file in the default editor
-  (creating it first if missing).
-- **Open Last Seen Data File** - opens the raw store JSON.
+  resolves display names (`users.info`, cached) and saves an enriched JSON through the
+  existing save-dialog flow.
+- **Open Watchlist** - opens the watchlist file in the default editor (creating it
+  with instructions first if missing).
+- **Open Transition Log** - opens the JSONL log file.
 
 ## Error handling
 
@@ -148,7 +212,8 @@ Following the repo pattern (pure logic in a required module, `node --test`):
   watchlistIds)` (rewrite logic including cap and malformed-frame pass-through),
   `applyPresenceEvent(store, event, now)` (state reducer), `parseWatchlist(raw)`.
 - Tests cover: merge dedupe/cap/pass-through, active/away transition semantics, away
-  baseline vs real transition, subscription-log ring buffer, invalid watchlist handling.
+  baseline vs real transition (baseline flag detection), transition-log line formatting
+  and duplicate suppression, subscription-log ring buffer, invalid watchlist handling.
 - Manual verification: add a non-sidebar user id to the watchlist, confirm a
   `presence_change` baseline arrives for them (debug log) and the store updates; confirm
   official-behavior parity with the tap disabled.
