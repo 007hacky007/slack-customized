@@ -598,6 +598,13 @@ function broadcastWatchlist() {
   }
 }
 
+function writeWatchlistFile(users) {
+  const doc = { instructions: WATCHLIST_TEMPLATE.instructions, users };
+  const tmp = lastSeenWatchlistPath() + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(doc, null, 2));
+  fs.renameSync(tmp, lastSeenWatchlistPath());
+}
+
 function watchWatchlistFile() {
   try {
     if (watchlistWatcher) watchlistWatcher.close();
@@ -1902,14 +1909,21 @@ ipcMain.handle('slack-autocomplete:last-seen:watchlist', (event) => {
   return lastSeenWatchlist;
 });
 
-ipcMain.handle('slack-autocomplete:last-seen:open-file', async (event, payload = {}) => {
+ipcMain.handle('slack-autocomplete:last-seen:watchlist-update', (event, payload = {}) => {
   if (!isSlackSender(event)) throw new Error('last-seen rejected: untrusted sender');
-  let target;
-  if (payload.which === 'watchlist') { ensureWatchlistFile(); target = lastSeenWatchlistPath(); }
-  else if (payload.which === 'transitions') target = lastSeenTransitionsPath();
-  else target = lastSeenStorePath();
-  const err = await shell.openPath(target);
-  return { ok: !err, error: err || null };
+  const res = lastSeenCore.applyWatchlistUpdate(lastSeenWatchlist, {
+    add: typeof payload.add === 'string' ? payload.add : undefined,
+    remove: typeof payload.remove === 'string' ? payload.remove : undefined
+  });
+  if (!res.changed) return { ok: true, users: lastSeenWatchlist };
+  try {
+    writeWatchlistFile(res.users);
+  } catch (err) {
+    return { ok: false, users: lastSeenWatchlist, error: String((err && err.message) || err) };
+  }
+  lastSeenWatchlist = res.users;
+  broadcastWatchlist();
+  return { ok: true, users: lastSeenWatchlist };
 });
 
 ipcMain.handle('slack-autocomplete:open-external', async (_event, targetUrl) => {
