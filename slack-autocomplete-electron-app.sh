@@ -4325,8 +4325,38 @@ cat > preload.js <<'EOF'
     } catch (err) { log('presence tap injection failed', err); }
   }
 
+  // Bridge between the main-world tap (document CustomEvents) and the main
+  // process (IPC). Also relays watchlist updates from main into the main world.
+  function installPresenceBridge() {
+    if (!ipcRenderer) return;
+
+    function forward(kindEventName, kind) {
+      document.addEventListener(kindEventName, (ev) => {
+        let detail;
+        try { detail = JSON.parse(ev.detail); } catch (e) { return; }
+        const payload = Object.assign({ kind }, detail);
+        try { ipcRenderer.send('slack-autocomplete:last-seen:event', payload); } catch (e) { /* ignore */ }
+      });
+    }
+    forward('slack-autocomplete:ls-in', 'change');
+    forward('slack-autocomplete:ls-out', 'sub');
+
+    function pushWatchlist(ids) {
+      try {
+        document.dispatchEvent(new CustomEvent('slack-autocomplete:ls-watchlist', {
+          detail: JSON.stringify(Array.isArray(ids) ? ids : [])
+        }));
+      } catch (e) { /* ignore */ }
+    }
+    ipcRenderer.on('slack-autocomplete:last-seen-watchlist', (_event, ids) => pushWatchlist(ids));
+    ipcRenderer.invoke('slack-autocomplete:last-seen:watchlist')
+      .then((ids) => pushWatchlist(ids))
+      .catch(() => {});
+  }
+
   function init() {
     installPresenceTap();
+    installPresenceBridge();
     attachKeyListener();
     attachMouseListener();
     setupNativeContextMenu();
