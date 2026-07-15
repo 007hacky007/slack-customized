@@ -490,6 +490,71 @@ function effectiveDownloadsDir() {
   return appSettings.downloadsDir || app.getPath('downloads');
 }
 
+// --- Last-seen presence store (local only; never leaves the machine) ---
+let lastSeenStore = lastSeenCore.emptyStore();
+let lastSeenSaveTimer = null;
+const LAST_SEEN_SAVE_DEBOUNCE_MS = 2000;
+const LAST_SEEN_LOG_MAX_BYTES = 5 * 1024 * 1024;
+
+function lastSeenStorePath() { return path.join(app.getPath('userData'), 'last-seen.json'); }
+function lastSeenTransitionsPath() { return path.join(app.getPath('userData'), 'last-seen-transitions.jsonl'); }
+
+function loadLastSeenStore() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(lastSeenStorePath(), 'utf8'));
+    if (parsed && typeof parsed === 'object' && parsed.users) {
+      lastSeenStore = Object.assign(lastSeenCore.emptyStore(), parsed);
+    }
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') {
+      try { fs.copyFileSync(lastSeenStorePath(), lastSeenStorePath() + '.bak'); } catch (e) { /* ignore */ }
+      console.warn('last-seen store unreadable; starting fresh', err);
+    }
+    lastSeenStore = lastSeenCore.emptyStore();
+  }
+}
+
+function writeLastSeenStoreNow() {
+  const tmp = lastSeenStorePath() + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(lastSeenStore));
+    fs.renameSync(tmp, lastSeenStorePath());
+  } catch (err) {
+    console.warn('Failed to write last-seen store', err);
+    try { fs.unlinkSync(tmp); } catch (e) { /* ignore */ }
+  }
+}
+
+function scheduleLastSeenSave() {
+  if (lastSeenSaveTimer) return;
+  lastSeenSaveTimer = setTimeout(() => {
+    lastSeenSaveTimer = null;
+    writeLastSeenStoreNow();
+  }, LAST_SEEN_SAVE_DEBOUNCE_MS);
+}
+
+function flushLastSeenStore() {
+  if (lastSeenSaveTimer) { clearTimeout(lastSeenSaveTimer); lastSeenSaveTimer = null; }
+  writeLastSeenStoreNow();
+}
+
+function rotateTransitionsIfNeeded() {
+  try {
+    const st = fs.statSync(lastSeenTransitionsPath());
+    if (st.size > LAST_SEEN_LOG_MAX_BYTES) {
+      fs.renameSync(lastSeenTransitionsPath(), lastSeenTransitionsPath() + '.1');
+    }
+  } catch (err) { /* ENOENT is fine */ }
+}
+
+function appendTransitions(transitions) {
+  if (!transitions || !transitions.length) return;
+  rotateTransitionsIfNeeded();
+  const text = transitions.map((t) => lastSeenCore.formatTransitionLine(t)).join('\n') + '\n';
+  try { fs.appendFileSync(lastSeenTransitionsPath(), text); }
+  catch (err) { console.warn('Failed to append last-seen transitions', err); }
+}
+
 function uniqueSavePath(dir, filename) {
   const ext = path.extname(filename);
   const base = path.basename(filename, ext);
@@ -1760,6 +1825,7 @@ app.whenReady().then(() => {
   // Global default UA (covers auth popups etc.).
   session.defaultSession.setUserAgent(CHROME_UA);
   loadAppSettings();
+  loadLastSeenStore();
   installPermissionHandlers(session.defaultSession);
   installDownloadTracking(session.defaultSession);
   registerProtocolHandler();
@@ -1799,6 +1865,7 @@ app.on('browser-window-created', (_event, window) => {
 app.on('before-quit', () => {
   isQuitting = true;
   saveWindowStateNow();
+  flushLastSeenStore();
 });
 
 app.on('window-all-closed', () => {
