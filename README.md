@@ -25,6 +25,11 @@ everywhere else.
   (author lists backfilled), and resolved user names
 - Channel list export: public/private/all membership as JSON or plain text
 - Channel sections export/import: sidebar sections plus unsectioned channels to JSON, file embeds its own schema and editing instructions for hand- or LLM-editing, import is additive and previews a plan with Apply/Cancel before changing anything
+- Last seen (presence) tracking: records when tracked users were last online by
+  tapping the client's presence WebSocket, injects a hand-edited watchlist of extra
+  user ids into presence subscriptions, and shows current subscriptions, per-user
+  last-online, and a transition log in a "Last Seen" panel (File menu). Presence is
+  derived from live events only (throttled, no backfill); the data stays local.
 - Reaction analytics CLI (`analyze-reactions.js`)
 - Thread pop-out button in every thread header
 - Esc closes attachment views; "Clear Cache (Keep Login)" menu item
