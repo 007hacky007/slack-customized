@@ -4204,7 +4204,129 @@ cat > preload.js <<'EOF'
     log('IdleDetector polyfill installed');
   }
 
+  // ---------------- Last-seen presence tap (main-world WebSocket wrapper) ----------------
+  // Injected into the page's main world BEFORE Slack boots so it can wrap
+  // window.WebSocket. Fail-open everywhere: any error falls back to Slack's
+  // original behavior and the original frame is always sent. Bridges to this
+  // isolated world via CustomEvents on document.
+  function installPresenceTap() {
+    const source = '(' + function () {
+      'use strict';
+      try {
+        var USER_ID_RE = /^[UW][A-Z0-9]{2,}$/;
+        var CAP = 100;
+        var watchlist = [];
+        var lastClientIds = null;   // ids from the most recent client presence_sub
+        var taps = [];              // instrumented sockets that have sent a sub
+
+        function dedupeValid(list) {
+          var out = [], seen = {};
+          if (!list || !list.length) return out;
+          for (var i = 0; i < list.length; i++) {
+            var id = typeof list[i] === 'string' ? list[i] : '';
+            if (!USER_ID_RE.test(id) || seen[id]) continue;
+            seen[id] = 1; out.push(id);
+          }
+          return out;
+        }
+
+        function merge(clientIds) {
+          var clientSet = {}; for (var i = 0; i < clientIds.length; i++) clientSet[clientIds[i]] = 1;
+          var injected = [];
+          for (var j = 0; j < watchlist.length && injected.length < CAP; j++) {
+            if (!clientSet[watchlist[j]]) injected.push(watchlist[j]);
+          }
+          return { ids: clientIds.concat(injected), clientIds: clientIds, injectedIds: injected };
+        }
+
+        function emit(name, detail) {
+          try { document.dispatchEvent(new CustomEvent(name, { detail: JSON.stringify(detail) })); }
+          catch (e) { /* ignore */ }
+        }
+
+        var NativeWS = window.WebSocket;
+        if (!NativeWS) return;
+
+        function WrappedWS(url, protocols) {
+          var ws = protocols === undefined ? new NativeWS(url) : new NativeWS(url, protocols);
+          var isSlack = false;
+          try { isSlack = /(^|\.)slack\.com$/.test(new URL(url).hostname); } catch (e) { isSlack = false; }
+          if (!isSlack) return ws;
+
+          ws.addEventListener('message', function (ev) {
+            try {
+              if (typeof ev.data !== 'string') return;
+              var msg = JSON.parse(ev.data);
+              if (msg && msg.type === 'presence_change') {
+                emit('slack-autocomplete:ls-in', {
+                  ids: Array.isArray(msg.users) ? msg.users : (msg.user ? [msg.user] : []),
+                  presence: msg.presence
+                });
+              }
+            } catch (e) { /* ignore */ }
+          });
+
+          var nativeSend = ws.send.bind(ws);
+          ws.send = function (data) {
+            try {
+              if (typeof data === 'string' && data.indexOf('presence_sub') !== -1) {
+                var frame = JSON.parse(data);
+                if (frame && frame.type === 'presence_sub') {
+                  var clientIds = dedupeValid(frame.ids);
+                  lastClientIds = clientIds;
+                  if (taps.indexOf(ws) === -1) taps.push(ws);
+                  var m = merge(clientIds);
+                  emit('slack-autocomplete:ls-out', { clientIds: m.clientIds, injectedIds: m.injectedIds });
+                  if (m.injectedIds.length) {
+                    frame.ids = m.ids;
+                    return nativeSend(JSON.stringify(frame));
+                  }
+                }
+              }
+            } catch (e) { /* fall through to original send */ }
+            return nativeSend(data);
+          };
+          return ws;
+        }
+        WrappedWS.prototype = NativeWS.prototype;
+        ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (k) {
+          try { WrappedWS[k] = NativeWS[k]; } catch (e) { /* ignore */ }
+        });
+        window.WebSocket = WrappedWS;
+
+        // Watchlist updates from the isolated world. On change, proactively
+        // re-subscribe on any open tapped socket so new ids take effect without
+        // waiting for Slack's next presence_sub. Sending the client ids through
+        // our own send wrapper keeps a single merge path (it re-merges the
+        // current watchlist in, which is idempotent).
+        document.addEventListener('slack-autocomplete:ls-watchlist', function (ev) {
+          try {
+            watchlist = dedupeValid(JSON.parse(ev.detail));
+            if (lastClientIds) {
+              var m = merge(lastClientIds);
+              for (var i = 0; i < taps.length; i++) {
+                var t = taps[i];
+                if (t && t.readyState === 1) {
+                  try { t.send(JSON.stringify({ type: 'presence_sub', ids: m.clientIds })); }
+                  catch (e) { /* ignore */ }
+                }
+              }
+            }
+          } catch (e) { /* ignore */ }
+        });
+      } catch (e) { /* fail open: leave native WebSocket untouched */ }
+    }.toString() + ')();';
+
+    try {
+      const el = document.createElement('script');
+      el.textContent = source;
+      (document.head || document.documentElement).appendChild(el);
+      el.parentNode.removeChild(el);
+    } catch (err) { log('presence tap injection failed', err); }
+  }
+
   function init() {
+    installPresenceTap();
     attachKeyListener();
     attachMouseListener();
     setupNativeContextMenu();
