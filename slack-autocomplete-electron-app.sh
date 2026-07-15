@@ -4392,6 +4392,40 @@ cat > preload.js <<'EOF'
     return lastSeenNameCache;
   }
 
+  // Workspace roster for watchlist name search. Fetched once per window via
+  // the rate-limited api-call bridge; also pre-fills the name cache.
+  let lastSeenRoster = null;
+  let lastSeenRosterPromise = null;
+  function fetchLastSeenRoster() {
+    if (lastSeenRoster) return Promise.resolve(lastSeenRoster);
+    if (!lastSeenRosterPromise) {
+      lastSeenRosterPromise = (async () => {
+        const cfg = getExportConfig(function () {}, { requireChannel: false });
+        const apiCall = createApiCall(cfg, null, function () {});
+        const out = [];
+        let cursor;
+        for (let page = 0; page < 25; page++) {
+          const params = { limit: 200 };
+          if (cursor) params.cursor = cursor;
+          const resp = await apiCall('users.list', params);
+          if (!resp || !resp.ok) throw new Error('users.list failed: ' + ((resp && resp.error) || 'unknown'));
+          for (const u of (resp.members || [])) {
+            if (!u || u.deleted || u.is_bot || u.id === 'USLACKBOT') continue;
+            const e = exportCore.buildUserEntry(u);
+            out.push(e);
+            lastSeenNameCache[e.id] = e.name || e.id;
+          }
+          cursor = resp.response_metadata && resp.response_metadata.next_cursor;
+          if (!cursor) break;
+        }
+        lastSeenRoster = out;
+        return out;
+      })();
+      lastSeenRosterPromise.catch(() => { lastSeenRosterPromise = null; });
+    }
+    return lastSeenRosterPromise;
+  }
+
   // ---------------- Last Seen viewer panel ----------------
   function setupLastSeenPanel() {
     if (!ipcRenderer) return;
