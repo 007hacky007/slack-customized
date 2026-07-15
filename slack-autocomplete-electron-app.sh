@@ -2044,7 +2044,7 @@ cat > preload.js <<'EOF'
     return;
   }
 
-  const { ipcRenderer } = require('electron');
+  const { ipcRenderer, webFrame } = require('electron');
   const exportCore = require('./export-core.js');
   const lastSeenCore = require('./last-seen-core.js');
 
@@ -4317,11 +4317,12 @@ cat > preload.js <<'EOF'
       } catch (e) { /* fail open: leave native WebSocket untouched */ }
     }.toString() + ')();';
 
+    // Slack's CSP blocks inline <script> elements, so evaluate the source via
+    // webFrame instead: DevTools-style evaluation is exempt from the page CSP
+    // and runs in the main world.
     try {
-      const el = document.createElement('script');
-      el.textContent = source;
-      (document.head || document.documentElement).appendChild(el);
-      el.parentNode.removeChild(el);
+      webFrame.executeJavaScript(source)
+        .catch((err) => log('presence tap injection failed', err));
     } catch (err) { log('presence tap injection failed', err); }
   }
 
