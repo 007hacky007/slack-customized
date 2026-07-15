@@ -555,6 +555,63 @@ function appendTransitions(transitions) {
   catch (err) { console.warn('Failed to append last-seen transitions', err); }
 }
 
+// --- Last-seen watchlist (hand-edited file; hot-reloaded) ---
+let lastSeenWatchlist = [];
+let watchlistWatcher = null;
+let watchlistReloadTimer = null;
+
+function lastSeenWatchlistPath() { return path.join(app.getPath('userData'), 'last-seen-watchlist.json'); }
+
+const WATCHLIST_TEMPLATE = {
+  instructions: [
+    'Add Slack user ids (they look like U012ABC or W012ABC) to the "users" array below.',
+    'These users are subscribed to for presence in addition to whoever your Slack UI already tracks,',
+    'so their online/away changes are recorded even when they are not on screen.',
+    'Find a user id from their profile (More > Copy member ID) or the Last Seen export.',
+    'At most 100 ids are injected. Save the file; the app reloads it automatically.'
+  ],
+  users: []
+};
+
+function ensureWatchlistFile() {
+  try {
+    if (!fs.existsSync(lastSeenWatchlistPath())) {
+      fs.writeFileSync(lastSeenWatchlistPath(), JSON.stringify(WATCHLIST_TEMPLATE, null, 2));
+    }
+  } catch (err) { console.warn('Failed to create watchlist file', err); }
+}
+
+function loadWatchlist() {
+  let raw = null;
+  try { raw = fs.readFileSync(lastSeenWatchlistPath(), 'utf8'); }
+  catch (err) { lastSeenWatchlist = []; return; }
+  const parsed = lastSeenCore.parseWatchlist(raw);
+  if (!parsed.ok) console.warn('watchlist parse error:', parsed.error);
+  lastSeenWatchlist = parsed.users;
+}
+
+function broadcastWatchlist() {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win || win.isDestroyed() || win.__sawPool) continue;
+    try { win.webContents.send('slack-autocomplete:last-seen-watchlist', lastSeenWatchlist); }
+    catch (err) { /* ignore */ }
+  }
+}
+
+function watchWatchlistFile() {
+  try {
+    if (watchlistWatcher) watchlistWatcher.close();
+    watchlistWatcher = fs.watch(lastSeenWatchlistPath(), () => {
+      if (watchlistReloadTimer) clearTimeout(watchlistReloadTimer);
+      watchlistReloadTimer = setTimeout(() => {
+        watchlistReloadTimer = null;
+        loadWatchlist();
+        broadcastWatchlist();
+      }, 300);
+    });
+  } catch (err) { console.warn('Failed to watch watchlist file', err); }
+}
+
 function uniqueSavePath(dir, filename) {
   const ext = path.extname(filename);
   const base = path.basename(filename, ext);
@@ -1826,6 +1883,9 @@ app.whenReady().then(() => {
   session.defaultSession.setUserAgent(CHROME_UA);
   loadAppSettings();
   loadLastSeenStore();
+  ensureWatchlistFile();
+  loadWatchlist();
+  watchWatchlistFile();
   installPermissionHandlers(session.defaultSession);
   installDownloadTracking(session.defaultSession);
   registerProtocolHandler();
