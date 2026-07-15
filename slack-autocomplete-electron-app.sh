@@ -526,7 +526,7 @@ function writeLastSeenStoreNow() {
 }
 
 function scheduleLastSeenSave() {
-  if (lastSeenSaveTimer) return;
+  if (lastSeenSaveTimer) clearTimeout(lastSeenSaveTimer);
   lastSeenSaveTimer = setTimeout(() => {
     lastSeenSaveTimer = null;
     writeLastSeenStoreNow();
