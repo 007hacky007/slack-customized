@@ -62,6 +62,31 @@ function mergePresenceSub(frameString, watchlistIds) {
   return { changed: true, frame: JSON.stringify(merged), clientIds, injectedIds };
 }
 
+function recordSubscription(store, clientIds, injectedIds, nowIso) {
+  const cleanClient = dedupeValidIds(clientIds);
+  const cleanInjected = dedupeValidIds(injectedIds);
+  const allIds = dedupeValidIds(cleanClient.concat(cleanInjected));
+  const prev = new Set(store.lastSubscribedIds || []);
+
+  const pending = new Set(store.pendingBaseline || []);
+  for (const id of allIds) {
+    if (!prev.has(id)) pending.add(id);
+  }
+  // Drop pending-baseline ids that are no longer subscribed at all.
+  const allSet = new Set(allIds);
+  for (const id of Array.from(pending)) {
+    if (!allSet.has(id)) pending.delete(id);
+  }
+  store.pendingBaseline = Array.from(pending);
+  store.lastSubscribedIds = allIds;
+
+  store.subscriptionLog.push({ at: nowIso, clientIds: cleanClient, injectedIds: cleanInjected });
+  if (store.subscriptionLog.length > SUB_LOG_MAX) {
+    store.subscriptionLog = store.subscriptionLog.slice(-SUB_LOG_MAX);
+  }
+  return store;
+}
+
 module.exports = {
   WATCHLIST_CAP,
   SUB_LOG_MAX,
@@ -69,5 +94,6 @@ module.exports = {
   emptyStore,
   dedupeValidIds,
   parseWatchlist,
-  mergePresenceSub
+  mergePresenceSub,
+  recordSubscription
 };

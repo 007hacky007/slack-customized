@@ -88,3 +88,38 @@ test('mergePresenceSub preserves other frame fields', () => {
   const r = core.mergePresenceSub(f, ['U222BBB']);
   assert.equal(JSON.parse(r.frame).extra, 'keep');
 });
+
+test('recordSubscription marks newly added ids as pending baseline', () => {
+  const s = core.emptyStore();
+  core.recordSubscription(s, ['U111AAA'], ['U222BBB'], '2026-07-15T08:00:00.000Z');
+  assert.deepEqual(s.lastSubscribedIds, ['U111AAA', 'U222BBB']);
+  assert.deepEqual(s.pendingBaseline.sort(), ['U111AAA', 'U222BBB']);
+  assert.equal(s.subscriptionLog.length, 1);
+  assert.deepEqual(s.subscriptionLog[0], {
+    at: '2026-07-15T08:00:00.000Z', clientIds: ['U111AAA'], injectedIds: ['U222BBB']
+  });
+});
+
+test('recordSubscription drops ids no longer subscribed from pendingBaseline', () => {
+  const s = core.emptyStore();
+  core.recordSubscription(s, ['U111AAA', 'U222BBB'], [], '2026-07-15T08:00:00.000Z');
+  core.recordSubscription(s, ['U111AAA'], [], '2026-07-15T08:01:00.000Z');
+  assert.deepEqual(s.lastSubscribedIds, ['U111AAA']);
+  assert.deepEqual(s.pendingBaseline, ['U111AAA']);
+});
+
+test('recordSubscription only adds genuinely new ids to pendingBaseline', () => {
+  const s = core.emptyStore();
+  core.recordSubscription(s, ['U111AAA'], [], '2026-07-15T08:00:00.000Z');
+  s.pendingBaseline = []; // simulate baseline already consumed
+  core.recordSubscription(s, ['U111AAA', 'U333CCC'], [], '2026-07-15T08:02:00.000Z');
+  assert.deepEqual(s.pendingBaseline, ['U333CCC']);
+});
+
+test('recordSubscription trims the log to SUB_LOG_MAX', () => {
+  const s = core.emptyStore();
+  for (let i = 0; i < core.SUB_LOG_MAX + 10; i++) {
+    core.recordSubscription(s, ['U111AAA'], [], '2026-07-15T08:00:00.000Z');
+  }
+  assert.equal(s.subscriptionLog.length, core.SUB_LOG_MAX);
+});
