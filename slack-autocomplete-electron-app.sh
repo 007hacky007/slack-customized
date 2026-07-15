@@ -137,6 +137,7 @@ const {
 const fs = require('fs');
 const path = require('path');
 const exportCore = require('./export-core.js');
+const lastSeenCore = require('./last-seen-core.js');
 
 // You can override this when launching by setting SLACK_URL env var.
 // Example:
@@ -1824,6 +1825,7 @@ cat > preload.js <<'EOF'
 
   const { ipcRenderer } = require('electron');
   const exportCore = require('./export-core.js');
+  const lastSeenCore = require('./last-seen-core.js');
 
   const DEBUG = (() => {
     try {
@@ -4940,6 +4942,16 @@ if [[ -f "$SCRIPT_DIR/export-core.js" ]]; then
   echo "Copied export-core.js"
 else
   echo "WARNING: export-core.js not found next to the script; export feature will not load." >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Copy pure last-seen-core module (unit-tested separately) into the app dir
+# ---------------------------------------------------------------------------
+if [[ -f "$SCRIPT_DIR/last-seen-core.js" ]]; then
+  cp "$SCRIPT_DIR/last-seen-core.js" "$APP_DIR/last-seen-core.js"
+  echo "Copied last-seen-core.js"
+else
+  echo "WARNING: last-seen-core.js not found next to the script; last-seen feature will not load." >&2
 fi
 
 echo "Created preload.js"
