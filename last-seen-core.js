@@ -87,6 +87,51 @@ function recordSubscription(store, clientIds, injectedIds, nowIso) {
   return store;
 }
 
+function applyPresenceEvent(store, event, nowIso) {
+  const transitions = [];
+  if (!event || typeof event !== 'object') return { store, transitions };
+  const presence = event.presence;
+  if (presence !== 'active' && presence !== 'away') return { store, transitions };
+
+  let ids = event.ids;
+  if (!Array.isArray(ids)) ids = event.user ? [event.user] : [];
+  const pending = new Set(store.pendingBaseline || []);
+
+  for (const raw of ids) {
+    if (typeof raw !== 'string' || !USER_ID_RE.test(raw)) continue;
+    const id = raw;
+    let entry = store.users[id];
+    const isNew = !entry;
+    if (isNew) {
+      entry = { lastPresence: null, lastActiveAt: null, lastAwayAt: null,
+                lastEventAt: null, firstTrackedAt: nowIso };
+      store.users[id] = entry;
+    }
+    const changed = entry.lastPresence !== presence;
+    if (presence === 'active') entry.lastActiveAt = nowIso;
+    else entry.lastAwayAt = nowIso;
+    entry.lastPresence = presence;
+    entry.lastEventAt = nowIso;
+
+    const wasPending = pending.has(id);
+    if (wasPending) pending.delete(id);
+    if (changed) {
+      transitions.push({ at: nowIso, user: id, presence, baseline: !!wasPending });
+    }
+  }
+  store.pendingBaseline = Array.from(pending);
+  return { store, transitions };
+}
+
+function formatTransitionLine(t) {
+  return JSON.stringify({ at: t.at, user: t.user, presence: t.presence, baseline: !!t.baseline });
+}
+
+function describeLastSeen(entry) {
+  const state = entry && entry.lastPresence === 'active' ? 'online' : 'offline';
+  return { state, lastOnlineAt: (entry && entry.lastActiveAt) || null };
+}
+
 module.exports = {
   WATCHLIST_CAP,
   SUB_LOG_MAX,
@@ -95,5 +140,8 @@ module.exports = {
   dedupeValidIds,
   parseWatchlist,
   mergePresenceSub,
-  recordSubscription
+  recordSubscription,
+  applyPresenceEvent,
+  formatTransitionLine,
+  describeLastSeen
 };
