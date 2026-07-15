@@ -609,6 +609,7 @@ function watchWatchlistFile() {
         broadcastWatchlist();
       }, 300);
     });
+    watchlistWatcher.on('error', (err) => { console.warn('watchlist watcher error', err); });
   } catch (err) { console.warn('Failed to watch watchlist file', err); }
 }
 
