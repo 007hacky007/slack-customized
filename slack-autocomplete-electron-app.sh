@@ -4430,6 +4430,10 @@ cat > preload.js <<'EOF'
   function setupLastSeenPanel() {
     if (!ipcRenderer) return;
     let root = null, visible = false;
+    let txLimit = 50;
+    let searchQuery = '';
+    let searchTimer = null;
+    let pendingSection = null;
 
     function fmtTime(iso) {
       if (!iso) return '-';
@@ -4469,11 +4473,127 @@ cat > preload.js <<'EOF'
       (document.body || document.documentElement).appendChild(root);
     }
 
-    function section(titleText) {
+    function section(titleText, anchorId) {
       const h = document.createElement('div');
       h.textContent = titleText;
+      if (anchorId) h.id = anchorId;
       h.style.cssText = 'font-weight:700;margin:10px 0 4px;color:#cfcfcf;';
       return h;
+    }
+
+    function rowButton(labelText) {
+      const b = document.createElement('button');
+      b.textContent = labelText;
+      b.style.cssText = 'background:#2a292a;color:#ddd;border:1px solid #4a494a;border-radius:5px;'
+        + 'padding:1px 8px;margin-left:8px;cursor:pointer;font-size:11px;flex:none;';
+      return b;
+    }
+
+    async function updateWatchlist(change, statusEl) {
+      try {
+        const res = await ipcRenderer.invoke('slack-autocomplete:last-seen:watchlist-update', change);
+        if (!res || !res.ok) throw new Error((res && res.error) || 'update failed');
+        render();
+      } catch (e) {
+        if (statusEl) statusEl.textContent = 'Watchlist update failed: ' + String((e && e.message) || e);
+      }
+    }
+
+    function buildWatchlistSection(body, watchlist, names) {
+      body.appendChild(section('Watchlist', 'slack-autocomplete-ls-sec-watchlist'));
+      const watchSet = new Set(watchlist);
+
+      const search = document.createElement('input');
+      search.type = 'text';
+      search.placeholder = 'Search users by name (or paste a user ID)...';
+      search.value = searchQuery;
+      search.style.cssText = 'width:100%;box-sizing:border-box;background:#121212;color:#fff;'
+        + 'border:1px solid #3a393a;border-radius:6px;padding:5px 8px;font-size:12px;';
+      const status = document.createElement('div');
+      status.style.cssText = 'font-size:11px;color:#9a9a9a;padding:3px 0;min-height:14px;';
+      const results = document.createElement('div');
+
+      function matchRow(entry) {
+        const line = document.createElement('div');
+        line.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:3px 0;';
+        const label = document.createElement('span');
+        label.textContent = (entry.name || entry.id) + '  (' + entry.id + ')';
+        label.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+        line.appendChild(label);
+        if (watchSet.has(entry.id)) {
+          const mark = document.createElement('span');
+          mark.textContent = 'added';
+          mark.style.cssText = 'color:#2bac76;font-size:11px;margin-left:8px;flex:none;';
+          line.appendChild(mark);
+        } else {
+          const add = rowButton('Add');
+          add.addEventListener('click', () => updateWatchlist({ add: entry.id }, status));
+          line.appendChild(add);
+        }
+        return line;
+      }
+
+      async function refreshResults() {
+        const q = searchQuery.trim();
+        results.textContent = '';
+        status.textContent = '';
+        if (q.length < 2) return;
+        let roster = null;
+        try {
+          if (!lastSeenRoster) status.textContent = 'Loading directory...';
+          roster = await fetchLastSeenRoster();
+          status.textContent = '';
+        } catch (e) {
+          status.textContent = 'directory unavailable - paste a user ID instead';
+        }
+        if (q !== searchQuery.trim()) return; // stale response, a newer query took over
+        let matches = roster ? lastSeenCore.filterRoster(roster, q, 10) : [];
+        if (!matches.length && lastSeenCore.USER_ID_RE.test(q.toUpperCase())) {
+          const id = q.toUpperCase();
+          const names2 = await resolveUserNames([id]);
+          matches = [{ id, name: names2[id] || id }];
+        }
+        results.textContent = '';
+        if (!matches.length && q.length >= 2 && roster) {
+          const p = document.createElement('div');
+          p.textContent = '(no matches)';
+          p.style.color = '#9a9a9a';
+          results.appendChild(p);
+        }
+        for (const m of matches) results.appendChild(matchRow(m));
+      }
+
+      search.addEventListener('input', () => {
+        searchQuery = search.value;
+        if (searchTimer) clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => { searchTimer = null; refreshResults(); }, 250);
+      });
+
+      body.appendChild(search);
+      body.appendChild(status);
+      body.appendChild(results);
+
+      const count = document.createElement('div');
+      count.textContent = watchlist.length + ' watched (100 injected max)';
+      count.style.cssText = 'font-size:11px;color:#9a9a9a;padding:4px 0;';
+      body.appendChild(count);
+      if (!watchlist.length) {
+        const p = document.createElement('div');
+        p.textContent = '(watchlist is empty)';
+        body.appendChild(p);
+      }
+      for (const id of watchlist) {
+        const line = document.createElement('div');
+        line.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:3px 0;border-bottom:1px solid #2a292a;';
+        const label = document.createElement('span');
+        label.textContent = (names[id] || id) + '  (' + id + ')';
+        label.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+        const rm = rowButton('Remove');
+        rm.addEventListener('click', () => updateWatchlist({ remove: id }, status));
+        line.appendChild(label); line.appendChild(rm);
+        body.appendChild(line);
+      }
+      if (searchQuery.trim().length >= 2) refreshResults();
     }
 
     async function render() {
@@ -4483,13 +4603,14 @@ cat > preload.js <<'EOF'
       let snap, recent;
       try {
         snap = await ipcRenderer.invoke('slack-autocomplete:last-seen:snapshot');
-        recent = await ipcRenderer.invoke('slack-autocomplete:last-seen:recent-transitions', { limit: 30 });
+        recent = await ipcRenderer.invoke('slack-autocomplete:last-seen:recent-transitions', { limit: txLimit });
       } catch (e) { body.textContent = 'Failed to load last-seen data.'; return; }
 
       const userIds = Object.keys(snap.users || {});
       const sub = snap.currentSubscription || { clientIds: [], injectedIds: [] };
       const allIds = Array.from(new Set(userIds
         .concat(sub.clientIds || []).concat(sub.injectedIds || [])
+        .concat(snap.watchlist || [])
         .concat((recent || []).map((t) => t.user))));
       const names = await resolveUserNames(allIds);
       const nameOf = (id) => (names[id] || id);
@@ -4497,11 +4618,14 @@ cat > preload.js <<'EOF'
 
       body.textContent = '';
 
+      // Watchlist editor.
+      buildWatchlistSection(body, snap.watchlist || [], names);
+
       // Tracked users, most recently online first.
       body.appendChild(section('Tracked users (' + userIds.length + ')'));
       const rows = userIds.map((id) => {
         const d = lastSeenCore.describeLastSeen(snap.users[id]);
-        return { id, d, entry: snap.users[id] };
+        return { id, d };
       }).sort((a, b) => String(b.d.lastOnlineAt || '').localeCompare(String(a.d.lastOnlineAt || '')));
       if (!rows.length) { const p = document.createElement('div'); p.textContent = 'No presence recorded yet.'; body.appendChild(p); }
       for (const r of rows) {
@@ -4526,14 +4650,27 @@ cat > preload.js <<'EOF'
       subBox.appendChild(cLine); subBox.appendChild(iLine);
       body.appendChild(subBox);
 
-      // Recent transitions.
-      body.appendChild(section('Recent transitions'));
+      // Transition log with resolved names.
+      body.appendChild(section('Transition log', 'slack-autocomplete-ls-sec-transitions'));
       if (!recent || !recent.length) { const p = document.createElement('div'); p.textContent = '(none logged yet)'; body.appendChild(p); }
       for (const t of (recent || [])) {
         const line = document.createElement('div');
         line.style.cssText = 'padding:2px 0;color:#bdbdbd;';
         line.textContent = fmtTime(t.at) + '  ' + nameOf(t.user) + '  ' + t.presence + (t.baseline ? '  (baseline)' : '');
         body.appendChild(line);
+      }
+      if (recent && recent.length >= txLimit && txLimit < 500) {
+        const more = rowButton('Load more');
+        more.style.marginLeft = '0';
+        more.style.marginTop = '6px';
+        more.addEventListener('click', () => { txLimit = Math.min(txLimit * 2, 500); render(); });
+        body.appendChild(more);
+      }
+
+      if (pendingSection) {
+        const el = root.querySelector('#slack-autocomplete-ls-sec-' + pendingSection);
+        if (el) { try { el.scrollIntoView({ block: 'start' }); } catch (e) { /* ignore */ } }
+        pendingSection = null;
       }
     }
 
@@ -4544,7 +4681,14 @@ cat > preload.js <<'EOF'
       if (visible) render();
     }
 
-    ipcRenderer.on('slack-autocomplete:last-seen:show-panel', () => toggle());
+    ipcRenderer.on('slack-autocomplete:last-seen:show-panel', (_event, payload) => {
+      if (payload && payload.section) {
+        pendingSection = payload.section;
+        toggle(true);
+      } else {
+        toggle();
+      }
+    });
   }
 
   // ---------------- Last Seen export ----------------
@@ -4586,9 +4730,6 @@ cat > preload.js <<'EOF'
   function setupLastSeenMenuActions() {
     if (!ipcRenderer) return;
     ipcRenderer.on('slack-autocomplete:last-seen:export', () => { runLastSeenExport(); });
-    ipcRenderer.on('slack-autocomplete:last-seen:open', (_event, payload) => {
-      ipcRenderer.invoke('slack-autocomplete:last-seen:open-file', { which: (payload && payload.which) || 'store' }).catch(() => {});
-    });
   }
 
   function init() {
