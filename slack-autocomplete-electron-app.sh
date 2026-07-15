@@ -810,14 +810,14 @@ function installApplicationMenu() {
               label: 'Open Watchlist',
               click: (_item, focusedWindow) => {
                 const w = focusedWindow || BrowserWindow.getFocusedWindow();
-                if (w) w.webContents.send('slack-autocomplete:last-seen:open', { which: 'watchlist' });
+                if (w) w.webContents.send('slack-autocomplete:last-seen:show-panel', { section: 'watchlist' });
               }
             },
             {
               label: 'Open Transition Log',
               click: (_item, focusedWindow) => {
                 const w = focusedWindow || BrowserWindow.getFocusedWindow();
-                if (w) w.webContents.send('slack-autocomplete:last-seen:open', { which: 'transitions' });
+                if (w) w.webContents.send('slack-autocomplete:last-seen:show-panel', { section: 'transitions' });
               }
             }
           ]
