@@ -27,8 +27,9 @@ everywhere else.
 - Channel sections export/import: sidebar sections plus unsectioned channels to JSON, file embeds its own schema and editing instructions for hand- or LLM-editing, import is additive and previews a plan with Apply/Cancel before changing anything
 - Last seen (presence) tracking: records when tracked users were last online by
   tapping the client's presence WebSocket and injects a watchlist of extra user
-  ids into presence subscriptions. The "Last Seen" panel (File menu) shows current
-  subscriptions, per-user last-online, a transition log with resolved names, and
+  ids into presence subscriptions. The "Last Seen" panel (File menu) refreshes in
+  place while open and shows current subscriptions, per-user last-online, a
+  transition log with resolved names, and
   an interactive watchlist editor with workspace name search (the watchlist file
   stays hand-editable). Presence is derived from live events only (throttled, no
   backfill); the data stays local.
