@@ -596,6 +596,20 @@ function broadcastWatchlist() {
     try { win.webContents.send('slack-autocomplete:last-seen-watchlist', lastSeenWatchlist); }
     catch (err) { /* ignore */ }
   }
+  broadcastLastSeenChanged();
+}
+
+let lastSeenChangedTimer = null;
+function broadcastLastSeenChanged() {
+  if (lastSeenChangedTimer) return; // trailing-edge throttle: one send per second max
+  lastSeenChangedTimer = setTimeout(() => {
+    lastSeenChangedTimer = null;
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win || win.isDestroyed() || win.__sawPool) continue;
+      try { win.webContents.send('slack-autocomplete:last-seen:changed'); }
+      catch (err) { /* ignore */ }
+    }
+  }, 1000);
 }
 
 function writeWatchlistFile(users) {
@@ -1871,11 +1885,13 @@ ipcMain.on('slack-autocomplete:last-seen:event', (event, payload = {}) => {
       lastSeenCore.recordSubscription(lastSeenStore, payload.clientIds || [], payload.injectedIds || [], now);
       lastSeenCurrentSub = { clientIds: payload.clientIds || [], injectedIds: payload.injectedIds || [], at: now };
       scheduleLastSeenSave();
+      broadcastLastSeenChanged();
     } else if (payload.kind === 'change') {
       const res = lastSeenCore.applyPresenceEvent(
         lastSeenStore, { ids: payload.ids, user: payload.user, presence: payload.presence }, now);
       appendTransitions(res.transitions);
       scheduleLastSeenSave();
+      broadcastLastSeenChanged();
     }
   } catch (err) { console.warn('last-seen event error', err); }
 });
