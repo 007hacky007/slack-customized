@@ -4450,10 +4450,29 @@ cat > preload.js <<'EOF'
     let searchQuery = '';
     let searchTimer = null;
     let pendingSection = null;
+    let refreshTimer = null;
+    let rendering = false, renderQueued = false;
+    let dirtyWhileTyping = false;
 
     function fmtTime(iso) {
       if (!iso) return '-';
       try { return new Date(iso).toLocaleString(); } catch (e) { return iso; }
+    }
+
+    function searchHasFocus() {
+      const a = document.activeElement;
+      return !!(root && a && root.contains(a) && a.tagName === 'INPUT');
+    }
+
+    function scheduleRefresh() {
+      if (!visible) return;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        if (!visible) return;
+        if (searchHasFocus()) { dirtyWhileTyping = true; return; }
+        render();
+      }, 500);
     }
 
     function ensurePanel() {
@@ -4584,6 +4603,17 @@ cat > preload.js <<'EOF'
         if (searchTimer) clearTimeout(searchTimer);
         searchTimer = setTimeout(() => { searchTimer = null; refreshResults(); }, 250);
       });
+      // Refreshes suppressed while the user was typing run once focus leaves.
+      // The 150ms delay lets a click on an Add/Remove button land before the
+      // DOM is rebuilt underneath it.
+      search.addEventListener('blur', () => {
+        setTimeout(() => {
+          if (dirtyWhileTyping && visible && !searchHasFocus()) {
+            dirtyWhileTyping = false;
+            render();
+          }
+        }, 150);
+      });
 
       body.appendChild(search);
       body.appendChild(status);
@@ -4613,9 +4643,20 @@ cat > preload.js <<'EOF'
     }
 
     async function render() {
+      if (rendering) { renderQueued = true; return; }
+      rendering = true;
+      try { await renderNow(); }
+      finally {
+        rendering = false;
+        if (renderQueued) { renderQueued = false; render(); }
+      }
+    }
+
+    async function renderNow() {
       ensurePanel();
       const body = root.querySelector('#slack-autocomplete-last-seen-body');
-      body.textContent = 'Loading...';
+      const prevScroll = body.scrollTop;
+      if (!body.childNodes.length) body.textContent = 'Loading...';
       let snap, recent;
       try {
         snap = await ipcRenderer.invoke('slack-autocomplete:last-seen:snapshot');
@@ -4683,6 +4724,7 @@ cat > preload.js <<'EOF'
         body.appendChild(more);
       }
 
+      body.scrollTop = prevScroll;
       if (pendingSection) {
         const el = root.querySelector('#slack-autocomplete-ls-sec-' + pendingSection);
         if (el) { try { el.scrollIntoView({ block: 'start' }); } catch (e) { /* ignore */ } }
@@ -4705,6 +4747,8 @@ cat > preload.js <<'EOF'
         toggle();
       }
     });
+
+    ipcRenderer.on('slack-autocomplete:last-seen:changed', () => scheduleRefresh());
   }
 
   // ---------------- Last Seen export ----------------
