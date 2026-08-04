@@ -1673,6 +1673,32 @@ ipcMain.handle('slack-autocomplete:update-badge', (_event, text) => {
   return { status: 'ok' };
 });
 
+// Trusted synthetic click, used by the preload's Cmd+K fallback. Slack's
+// top-nav search button ignores untrusted (renderer-synthesized) clicks, so
+// the click has to be injected through the input pipeline. Coordinates are
+// CSS pixels relative to the sender's viewport; sendInputEvent expects view
+// DIPs, which differ by the zoom factor.
+ipcMain.handle('slack-autocomplete:trusted-click', (event, payload = {}) => {
+  if (!isSlackSender(event)) throw new Error('trusted-click rejected: untrusted sender');
+  const { x, y } = payload;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return { ok: false, reason: 'bad-coordinates' };
+  }
+  const contents = event.sender;
+  let zoom = 1;
+  try { zoom = contents.getZoomFactor(); } catch (err) { /* keep 1 */ }
+  const px = Math.round(x * zoom);
+  const py = Math.round(y * zoom);
+  try {
+    contents.sendInputEvent({ type: 'mouseDown', x: px, y: py, button: 'left', clickCount: 1 });
+    contents.sendInputEvent({ type: 'mouseUp', x: px, y: py, button: 'left', clickCount: 1 });
+  } catch (err) {
+    console.warn('Failed to send trusted click', err);
+    return { ok: false, reason: 'send-failed' };
+  }
+  return { ok: true };
+});
+
 ipcMain.handle('slack-autocomplete:context-menu', (event, payload = {}) => {
   const browserWindow = BrowserWindow.fromWebContents(event.sender);
   if (!browserWindow) {
@@ -2077,6 +2103,7 @@ cat > preload.js <<'EOF'
   const { ipcRenderer, webFrame } = require('electron');
   const exportCore = require('./export-core.js');
   const lastSeenCore = require('./last-seen-core.js');
+  const cmdkCore = require('./cmdk-fallback-core.js');
 
   const DEBUG = (() => {
     try {
@@ -2536,6 +2563,56 @@ cat > preload.js <<'EOF'
     }
     const role = node.getAttribute('role');
     return role === 'textbox' || role === 'combobox' || role === 'searchbox';
+  }
+
+  // --- Cmd+K startup fallback -------------------------------------------
+  // Slack serves us the web client (Chrome UA), where the mod+k hotkey is
+  // gated on isUserAttentionOnChat() state plus the async k_key_omnibox
+  // feature flag - for seconds to minutes after boot Slack receives Cmd+K
+  // and deliberately drops it (verified by instrumenting the Mousetrap
+  // binding's filter live). The desktop client bypasses that gate via
+  // isDesktopApp(). The top-nav search button is not gated at all, so when
+  // Slack ignores the key we ask the main process for a trusted click on
+  // that button (untrusted element.click() is ignored too). As soon as the
+  // native handler works, a modal appears within the grace period and the
+  // fallback stays inert; decision logic lives in cmdk-fallback-core.js.
+  let cmdkFallbackTimer = null;
+  let cmdkLastFallbackAt = 0;
+
+  function countModalDialogs() {
+    return document.querySelectorAll('[aria-modal="true"]').length;
+  }
+
+  function installCmdKFallback() {
+    window.addEventListener(
+      'keydown',
+      (ev) => {
+        if (!cmdkCore.isCmdK(ev, IS_MAC_PRELOAD)) return;
+        const modalsAtKeydown = countModalDialogs();
+        if (cmdkFallbackTimer) clearTimeout(cmdkFallbackTimer);
+        cmdkFallbackTimer = setTimeout(() => {
+          cmdkFallbackTimer = null;
+          const btn = document.querySelector('[data-qa="top_nav_search"]');
+          const decision = cmdkCore.shouldFallback({
+            modalsAtKeydown,
+            modalsNow: countModalDialogs(),
+            buttonExists: Boolean(btn),
+            lastFallbackAt: cmdkLastFallbackAt || null,
+            now: Date.now()
+          });
+          if (!decision) return;
+          const rect = btn.getBoundingClientRect();
+          if (!rect.width || !rect.height) return;
+          cmdkLastFallbackAt = Date.now();
+          log('Cmd+K ignored by Slack; falling back to trusted search-button click.');
+          ipcRenderer?.invoke('slack-autocomplete:trusted-click', {
+            x: rect.left + rect.width / 2,
+            y: rect.top + rect.height / 2
+          }).catch((err) => log('Cmd+K fallback click failed', err));
+        }, cmdkCore.FALLBACK_DELAY_MS);
+      },
+      true
+    );
   }
 
   function setupNativeContextMenu() {
@@ -4796,6 +4873,7 @@ cat > preload.js <<'EOF'
     installPresenceTap();
     installPresenceBridge();
     attachKeyListener();
+    installCmdKFallback();
     attachMouseListener();
     setupNativeContextMenu();
     setupAutocompleteObservers();
@@ -5765,6 +5843,16 @@ if [[ -f "$SCRIPT_DIR/last-seen-core.js" ]]; then
   echo "Copied last-seen-core.js"
 else
   echo "WARNING: last-seen-core.js not found next to the script; last-seen feature will not load." >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Copy pure cmdk-fallback-core module (unit-tested separately) into the app dir
+# ---------------------------------------------------------------------------
+if [[ -f "$SCRIPT_DIR/cmdk-fallback-core.js" ]]; then
+  cp "$SCRIPT_DIR/cmdk-fallback-core.js" "$APP_DIR/cmdk-fallback-core.js"
+  echo "Copied cmdk-fallback-core.js"
+else
+  echo "WARNING: cmdk-fallback-core.js not found next to the script; Cmd+K fallback will not load." >&2
 fi
 
 echo "Created preload.js"

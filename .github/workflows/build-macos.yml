@@ -21,6 +21,9 @@ jobs:
       - name: Run export-core tests
         run: node --test test/export-core.test.js
 
+      - name: Run cmdk-fallback-core tests
+        run: node --test test/cmdk-fallback-core.test.js
+
   build:
     name: Build .app (Apple Silicon)
     needs: test

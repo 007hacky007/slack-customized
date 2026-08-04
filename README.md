@@ -56,6 +56,11 @@ how that was reverse-engineered):
 - Official-style file handling: raw file links become tracked downloads,
   viewer pop-ups get real windows
 - macOS split-screen tiling, hidden-inset title bar, standard window menu
+- Cmd+K works immediately after launch: Slack's web client drops the shortcut
+  until its "user attention on chat" state settles (the desktop client is
+  exempt via its user agent), so when Slack ignores the key the preload asks
+  the main process for a trusted click on the top-nav search button
+  (decision logic in `cmdk-fallback-core.js`)
 
 ## Build and run
 
