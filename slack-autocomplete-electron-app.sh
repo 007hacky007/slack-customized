@@ -5885,7 +5885,11 @@ cat > "$APP_DIR/extend-info.plist" <<'PLIST'
 PLIST
 
 echo "Packaging macOS app with electron-packager..."
-npx electron-packager . "$APP_NAME" \
+# extract-zip (inside electron-packager) never settles its extraction promise
+# on Node 26: the process drains and "succeeds" with an empty dist. Pin the
+# packager run to Node 22 LTS via the npm node binary package until upstream
+# handles current Node.
+npx -y -p node@22 -p electron-packager electron-packager . "$APP_NAME" \
   --platform=darwin \
   --arch="$EP_ARCH" \
   --out=dist \
@@ -5897,6 +5901,10 @@ npx electron-packager . "$APP_NAME" \
   "${ICON_ARGS[@]}" > /dev/null
 
 APP_PATH="$APP_DIR/dist/${APP_NAME}-darwin-${EP_ARCH}/${APP_NAME}.app"
+if [[ ! -d "$APP_PATH" ]]; then
+  echo "ERROR: electron-packager produced no app at $APP_PATH" >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Code signing: use a real identity from the local keychain when available.
