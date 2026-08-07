@@ -45,7 +45,11 @@ fi
 # Install Electron (dev dependency)
 # ---------------------------------------------------------------------------
 echo "Installing Electron + helpers (downloads ~150MB the first time)..."
-npm install --save-dev electron sharp
+# electron@latest, not plain electron: Slack drops support for old Chromium on a
+# rolling schedule (twice a year, May and November), so the bundled engine has to
+# keep moving. A caret range in package.json pins the major and silently strands
+# us on a Chromium version Slack has already dropped.
+npm install --save-dev electron@latest sharp
 
 # ---------------------------------------------------------------------------
 # Build macOS .icns from provided SVG (if present)
@@ -144,11 +148,14 @@ const lastSeenCore = require('./last-seen-core.js');
 //   SLACK_URL="https://app.slack.com/client/T12345678/C12345678" npm start
 const SLACK_URL = process.env.SLACK_URL || 'https://app.slack.com/client';
 
-// Present ourselves as a current, supported Chrome on macOS.
+// Present ourselves as a plain Chrome on macOS: the engine we genuinely run,
+// minus the Electron/app tokens that make Slack treat us as an unknown browser.
+// The version is read from the live Chromium rather than hardcoded, so an
+// Electron upgrade can never leave us advertising a version Slack has dropped.
 const CHROME_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
   'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-  'Chrome/142.0.7444.235 Safari/537.36';
+  'Chrome/' + (process.versions.chrome || '150.0.7871.212') + ' Safari/537.36';
 const REGISTERED_PROTOCOL = 'slack';
 const ICON_FILENAME = 'AppIcon.icns';
 let cachedIconImage;
