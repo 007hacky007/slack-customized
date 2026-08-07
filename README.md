@@ -27,12 +27,18 @@ everywhere else.
 - Channel sections export/import: sidebar sections plus unsectioned channels to JSON, file embeds its own schema and editing instructions for hand- or LLM-editing, import is additive and previews a plan with Apply/Cancel before changing anything
 - Last seen (presence) tracking: records when tracked users were last online by
   tapping the client's presence WebSocket and injects a watchlist of extra user
-  ids into presence subscriptions. The "Last Seen" panel (File menu) refreshes in
-  place while open and shows current subscriptions, per-user last-online, a
-  transition log with resolved names, and
-  an interactive watchlist editor with workspace name search (the watchlist file
-  stays hand-editable). Presence is derived from live events only (throttled, no
-  backfill); the data stays local.
+  ids into presence subscriptions. The "Last Seen" panel (File menu) is
+  draggable/resizable and updates each section in place while open (rows and
+  buttons are never rebuilt under the cursor) showing current subscriptions
+  (unioned across all windows), per-user last-online sorted online-first, a
+  transition log with resolved names, and an interactive watchlist editor with
+  workspace name search (the watchlist file stays hand-editable; hot reload
+  survives editor atomic saves, and a broken edit keeps the last good list and
+  shows the parse error). Names paint in the background from a disk-persisted
+  cache plus a bulk roster fetch, so the panel opens instantly. Presence state
+  is reset on every launch (only timestamps persist), so "online now" is never
+  claimed from stale pre-restart data. Presence is derived from live events
+  only (throttled, no backfill); the data stays local.
 - Reaction analytics CLI (`analyze-reactions.js`)
 - Thread pop-out button in every thread header
 - Esc closes attachment views; "Clear Cache (Keep Login)" menu item
@@ -76,7 +82,8 @@ every push and publishes a release with the zipped `.app` on `v*` tags.
 Downloaded release builds need `xattr -cr SlackAutocompleteElectron.app` once
 (ad-hoc signed, not notarized).
 
-Tests: `node --test test/export-core.test.js`
+Tests: `node --test` (covers export-core, last-seen-core, cmdk-fallback-core,
+and analyze-reactions)
 
 ## Caveats
 

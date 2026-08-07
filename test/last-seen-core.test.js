@@ -124,6 +124,34 @@ test('recordSubscription trims the log to SUB_LOG_MAX', () => {
   assert.equal(s.subscriptionLog.length, core.SUB_LOG_MAX);
 });
 
+test('recordSubscription with a union keeps other senders ids in pendingBaseline', () => {
+  const s = core.emptyStore();
+  // Window A subscribes U111AAA; union is just its own ids.
+  core.recordSubscription(s, ['U111AAA'], [], '2026-07-15T08:00:00.000Z', ['U111AAA']);
+  // Window B subscribes U222BBB; the union still contains window A's id.
+  core.recordSubscription(s, ['U222BBB'], [], '2026-07-15T08:00:05.000Z', ['U111AAA', 'U222BBB']);
+  assert.deepEqual([...s.pendingBaseline].sort(), ['U111AAA', 'U222BBB']);
+  assert.deepEqual([...s.lastSubscribedIds].sort(), ['U111AAA', 'U222BBB']);
+});
+
+test('recordSubscription with a union prunes only ids gone from the union', () => {
+  const s = core.emptyStore();
+  core.recordSubscription(s, ['U111AAA', 'U222BBB'], [], '2026-07-15T08:00:00.000Z', ['U111AAA', 'U222BBB']);
+  // U222BBB unsubscribed everywhere; U111AAA still held by another window.
+  core.recordSubscription(s, ['U333CCC'], [], '2026-07-15T08:01:00.000Z', ['U111AAA', 'U333CCC']);
+  assert.deepEqual([...s.pendingBaseline].sort(), ['U111AAA', 'U333CCC']);
+  assert.deepEqual([...s.lastSubscribedIds].sort(), ['U111AAA', 'U333CCC']);
+});
+
+test('recordSubscription log entry records the frame ids, not the union', () => {
+  const s = core.emptyStore();
+  core.recordSubscription(s, ['U111AAA'], ['U222BBB'], '2026-07-15T08:00:00.000Z',
+    ['U111AAA', 'U222BBB', 'U333CCC']);
+  assert.deepEqual(s.subscriptionLog[0], {
+    at: '2026-07-15T08:00:00.000Z', clientIds: ['U111AAA'], injectedIds: ['U222BBB']
+  });
+});
+
 test('applyPresenceEvent records first active event as a transition', () => {
   const s = core.emptyStore();
   const { transitions } = core.applyPresenceEvent(
@@ -185,6 +213,97 @@ test('describeLastSeen reports online vs offline', () => {
   assert.deepEqual(
     core.describeLastSeen({ lastPresence: 'away', lastActiveAt: '2026-07-15T08:00:00.000Z' }),
     { state: 'offline', lastOnlineAt: '2026-07-15T08:00:00.000Z' });
+});
+
+test('sanitizeLoadedStore nulls lastPresence but keeps timestamps', () => {
+  const s = core.emptyStore();
+  s.users.U111AAA = {
+    lastPresence: 'active', lastActiveAt: '2026-07-15T09:00:00.000Z',
+    lastAwayAt: null, lastEventAt: '2026-07-15T09:00:00.000Z',
+    firstTrackedAt: '2026-07-15T08:00:00.000Z'
+  };
+  core.sanitizeLoadedStore(s);
+  assert.equal(s.users.U111AAA.lastPresence, null);
+  assert.equal(s.users.U111AAA.lastActiveAt, '2026-07-15T09:00:00.000Z');
+  assert.equal(s.users.U111AAA.lastEventAt, '2026-07-15T09:00:00.000Z');
+  assert.equal(s.users.U111AAA.firstTrackedAt, '2026-07-15T08:00:00.000Z');
+});
+
+test('sanitizeLoadedStore folds lastSubscribedIds into pendingBaseline and clears them', () => {
+  const s = core.emptyStore();
+  s.lastSubscribedIds = ['U111AAA', 'U222BBB'];
+  s.pendingBaseline = ['U222BBB', 'U333CCC'];
+  core.sanitizeLoadedStore(s);
+  assert.deepEqual(s.lastSubscribedIds, []);
+  assert.deepEqual([...s.pendingBaseline].sort(), ['U111AAA', 'U222BBB', 'U333CCC']);
+});
+
+test('sanitizeLoadedStore makes the first post-restart event a baseline transition', () => {
+  const s = core.emptyStore();
+  s.users.U111AAA = {
+    lastPresence: 'active', lastActiveAt: '2026-07-15T09:00:00.000Z',
+    lastAwayAt: null, lastEventAt: '2026-07-15T09:00:00.000Z',
+    firstTrackedAt: '2026-07-15T08:00:00.000Z'
+  };
+  s.lastSubscribedIds = ['U111AAA'];
+  core.sanitizeLoadedStore(s);
+  const { transitions } = core.applyPresenceEvent(
+    s, { user: 'U111AAA', presence: 'away' }, '2026-07-16T07:00:00.000Z');
+  assert.equal(transitions.length, 1);
+  assert.equal(transitions[0].baseline, true);
+});
+
+test('sanitizeLoadedStore reports online only after a fresh event', () => {
+  const s = core.emptyStore();
+  s.users.U111AAA = {
+    lastPresence: 'active', lastActiveAt: '2026-07-15T09:00:00.000Z',
+    lastAwayAt: null, lastEventAt: '2026-07-15T09:00:00.000Z',
+    firstTrackedAt: '2026-07-15T08:00:00.000Z'
+  };
+  core.sanitizeLoadedStore(s);
+  assert.equal(core.describeLastSeen(s.users.U111AAA).state, 'offline');
+  assert.equal(core.describeLastSeen(s.users.U111AAA).lastOnlineAt, '2026-07-15T09:00:00.000Z');
+  core.applyPresenceEvent(s, { user: 'U111AAA', presence: 'active' }, '2026-07-16T07:00:00.000Z');
+  assert.equal(core.describeLastSeen(s.users.U111AAA).state, 'online');
+});
+
+test('sanitizeLoadedStore tolerates garbage user entries and missing fields', () => {
+  const s = { users: { U111AAA: null, U222BBB: 'junk' } };
+  core.sanitizeLoadedStore(s);
+  assert.deepEqual(s.lastSubscribedIds, []);
+  assert.deepEqual(s.pendingBaseline, []);
+});
+
+test('orderTrackedIds puts online users first even with older lastActiveAt', () => {
+  const users = {
+    UOFFLINE: { lastPresence: 'away', lastActiveAt: '2026-07-15T10:00:00.000Z' },
+    UONLINE1: { lastPresence: 'active', lastActiveAt: '2026-07-15T06:00:00.000Z' }
+  };
+  assert.deepEqual(core.orderTrackedIds(users), ['UONLINE1', 'UOFFLINE']);
+});
+
+test('orderTrackedIds sorts each group by lastActiveAt descending', () => {
+  const users = {
+    UOLD1AAA: { lastPresence: 'away', lastActiveAt: '2026-07-15T06:00:00.000Z' },
+    UNEW1AAA: { lastPresence: 'away', lastActiveAt: '2026-07-15T10:00:00.000Z' },
+    UON1AAA1: { lastPresence: 'active', lastActiveAt: '2026-07-15T07:00:00.000Z' },
+    UON2AAA2: { lastPresence: 'active', lastActiveAt: '2026-07-15T09:00:00.000Z' }
+  };
+  assert.deepEqual(core.orderTrackedIds(users),
+    ['UON2AAA2', 'UON1AAA1', 'UNEW1AAA', 'UOLD1AAA']);
+});
+
+test('orderTrackedIds puts never-active users last within their group', () => {
+  const users = {
+    UNEVER11: { lastPresence: 'away', lastActiveAt: null },
+    USEEN111: { lastPresence: 'away', lastActiveAt: '2026-07-15T10:00:00.000Z' }
+  };
+  assert.deepEqual(core.orderTrackedIds(users), ['USEEN111', 'UNEVER11']);
+});
+
+test('orderTrackedIds tolerates garbage input', () => {
+  assert.deepEqual(core.orderTrackedIds(null), []);
+  assert.deepEqual(core.orderTrackedIds({ U1: null, U2: 'junk' }), ['U1', 'U2']);
 });
 
 test('applyWatchlistUpdate adds a valid new id', () => {

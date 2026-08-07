@@ -62,10 +62,16 @@ function mergePresenceSub(frameString, watchlistIds) {
   return { changed: true, frame: JSON.stringify(merged), clientIds, injectedIds };
 }
 
-function recordSubscription(store, clientIds, injectedIds, nowIso) {
+// allSubscribedIds: union of ids subscribed across every sender (window/socket).
+// Baseline bookkeeping must run against the union, not this frame alone —
+// otherwise one window's small presence_sub prunes ids another window still
+// subscribes to. Omitted (single-sender callers, tests): the frame is the union.
+function recordSubscription(store, clientIds, injectedIds, nowIso, allSubscribedIds) {
   const cleanClient = dedupeValidIds(clientIds);
   const cleanInjected = dedupeValidIds(injectedIds);
-  const allIds = dedupeValidIds(cleanClient.concat(cleanInjected));
+  const allIds = allSubscribedIds === undefined
+    ? dedupeValidIds(cleanClient.concat(cleanInjected))
+    : dedupeValidIds(allSubscribedIds);
   const prev = new Set(store.lastSubscribedIds || []);
 
   const pending = new Set(store.pendingBaseline || []);
@@ -123,6 +129,25 @@ function applyPresenceEvent(store, event, nowIso) {
   return { store, transitions };
 }
 
+// A loaded store is stale by definition: presence events stopped when the app
+// quit, so any persisted lastPresence is untrustworthy and every previously
+// subscribed id must be re-baselined before its next event counts as a real
+// transition.
+function sanitizeLoadedStore(store) {
+  if (!store || typeof store !== 'object') return store;
+  if (!store.users || typeof store.users !== 'object') store.users = {};
+  for (const id of Object.keys(store.users)) {
+    const entry = store.users[id];
+    if (!entry || typeof entry !== 'object') { delete store.users[id]; continue; }
+    entry.lastPresence = null;
+  }
+  const pending = new Set(dedupeValidIds(store.pendingBaseline));
+  for (const id of dedupeValidIds(store.lastSubscribedIds)) pending.add(id);
+  store.pendingBaseline = Array.from(pending);
+  store.lastSubscribedIds = [];
+  return store;
+}
+
 function formatTransitionLine(t) {
   return JSON.stringify({ at: t.at, user: t.user, presence: t.presence, baseline: !!t.baseline });
 }
@@ -130,6 +155,23 @@ function formatTransitionLine(t) {
 function describeLastSeen(entry) {
   const state = entry && entry.lastPresence === 'active' ? 'online' : 'offline';
   return { state, lastOnlineAt: (entry && entry.lastActiveAt) || null };
+}
+
+function orderTrackedIds(users) {
+  if (!users || typeof users !== 'object') return [];
+  const ids = Object.keys(users);
+  const rank = (id) => {
+    const e = users[id];
+    const online = !!(e && typeof e === 'object' && e.lastPresence === 'active');
+    const at = (e && typeof e === 'object' && e.lastActiveAt) || '';
+    return { online, at };
+  };
+  return ids.sort((a, b) => {
+    const ra = rank(a), rb = rank(b);
+    if (ra.online !== rb.online) return ra.online ? -1 : 1;
+    if (ra.at !== rb.at) return ra.at > rb.at ? -1 : 1;
+    return a < b ? -1 : (a > b ? 1 : 0);
+  });
 }
 
 function applyWatchlistUpdate(users, change) {
@@ -179,8 +221,10 @@ module.exports = {
   mergePresenceSub,
   recordSubscription,
   applyPresenceEvent,
+  sanitizeLoadedStore,
   formatTransitionLine,
   describeLastSeen,
+  orderTrackedIds,
   applyWatchlistUpdate,
   filterRoster
 };

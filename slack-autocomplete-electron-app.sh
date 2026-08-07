@@ -510,7 +510,7 @@ function loadLastSeenStore() {
   try {
     const parsed = JSON.parse(fs.readFileSync(lastSeenStorePath(), 'utf8'));
     if (parsed && typeof parsed === 'object' && parsed.users) {
-      lastSeenStore = Object.assign(lastSeenCore.emptyStore(), parsed);
+      lastSeenStore = lastSeenCore.sanitizeLoadedStore(Object.assign(lastSeenCore.emptyStore(), parsed));
     }
   } catch (err) {
     if (err && err.code !== 'ENOENT') {
@@ -554,16 +554,81 @@ function rotateTransitionsIfNeeded() {
   } catch (err) { /* ENOENT is fine */ }
 }
 
+// Recent transitions are served from this ring; the jsonl file is only for
+// persistence and export. Reading and parsing the whole file (up to 5MB) on
+// every panel refresh was a measurable part of the refresh cost.
+const LAST_SEEN_TX_RING_MAX = 500;
+let lastSeenTxRing = null; // oldest-first; lazily loaded from the file tail
+
+function loadTransitionsRing() {
+  if (lastSeenTxRing) return;
+  lastSeenTxRing = [];
+  let text = '';
+  try { text = fs.readFileSync(lastSeenTransitionsPath(), 'utf8'); }
+  catch (err) { return; /* ENOENT is fine */ }
+  const lines = text.split('\n');
+  const newestFirst = [];
+  for (let i = lines.length - 1; i >= 0 && newestFirst.length < LAST_SEEN_TX_RING_MAX; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    try { newestFirst.push(JSON.parse(line)); } catch (e) { /* skip bad line */ }
+  }
+  lastSeenTxRing = newestFirst.reverse();
+}
+
 function appendTransitions(transitions) {
   if (!transitions || !transitions.length) return;
+  loadTransitionsRing();
+  lastSeenTxRing.push(...transitions);
+  if (lastSeenTxRing.length > LAST_SEEN_TX_RING_MAX) {
+    lastSeenTxRing = lastSeenTxRing.slice(-LAST_SEEN_TX_RING_MAX);
+  }
   rotateTransitionsIfNeeded();
   const text = transitions.map((t) => lastSeenCore.formatTransitionLine(t)).join('\n') + '\n';
   try { fs.appendFileSync(lastSeenTransitionsPath(), text); }
   catch (err) { console.warn('Failed to append last-seen transitions', err); }
 }
 
+// --- Last-seen persisted name cache (id -> display name) ---
+// Names resolved via users.info are throttled to one call per 600ms, so
+// re-resolving from scratch each session made the panel's first open crawl.
+const LAST_SEEN_NAMES_MAX = 5000;
+let lastSeenNames = null; // lazily loaded
+let lastSeenNamesSaveTimer = null;
+
+function lastSeenNamesPath() { return path.join(app.getPath('userData'), 'last-seen-names.json'); }
+
+function loadLastSeenNames() {
+  if (lastSeenNames) return;
+  lastSeenNames = {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(lastSeenNamesPath(), 'utf8'));
+    if (parsed && typeof parsed === 'object') lastSeenNames = parsed;
+  } catch (err) { /* ENOENT or garbage: start fresh */ }
+}
+
+function saveLastSeenNamesSoon() {
+  if (lastSeenNamesSaveTimer) clearTimeout(lastSeenNamesSaveTimer);
+  lastSeenNamesSaveTimer = setTimeout(() => {
+    lastSeenNamesSaveTimer = null;
+    const keys = Object.keys(lastSeenNames);
+    if (keys.length > LAST_SEEN_NAMES_MAX) {
+      for (const k of keys.slice(0, keys.length - LAST_SEEN_NAMES_MAX)) delete lastSeenNames[k];
+    }
+    const tmp = lastSeenNamesPath() + '.tmp';
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(lastSeenNames));
+      fs.renameSync(tmp, lastSeenNamesPath());
+    } catch (err) {
+      console.warn('Failed to write last-seen name cache', err);
+      try { fs.unlinkSync(tmp); } catch (e) { /* ignore */ }
+    }
+  }, 2000);
+}
+
 // --- Last-seen watchlist (hand-edited file; hot-reloaded) ---
 let lastSeenWatchlist = [];
+let lastSeenWatchlistError = null;
 let watchlistWatcher = null;
 let watchlistReloadTimer = null;
 
@@ -591,15 +656,29 @@ function ensureWatchlistFile() {
 function loadWatchlist() {
   let raw = null;
   try { raw = fs.readFileSync(lastSeenWatchlistPath(), 'utf8'); }
-  catch (err) { lastSeenWatchlist = []; return; }
+  catch (err) {
+    if (err && err.code === 'ENOENT') { lastSeenWatchlist = []; lastSeenWatchlistError = null; }
+    else lastSeenWatchlistError = String((err && err.message) || err);
+    return;
+  }
   const parsed = lastSeenCore.parseWatchlist(raw);
-  if (!parsed.ok) console.warn('watchlist parse error:', parsed.error);
+  if (!parsed.ok) {
+    // Mid-edit garbage must not unsubscribe everything: keep the last good
+    // list and surface the error in the panel instead.
+    console.warn('watchlist parse error:', parsed.error);
+    lastSeenWatchlistError = parsed.error;
+    return;
+  }
+  lastSeenWatchlistError = null;
   lastSeenWatchlist = parsed.users;
 }
 
 function broadcastWatchlist() {
+  // Pool windows run a full Slack client and inject the watchlist too, so
+  // they must see edits — skipping them left different windows subscribing
+  // different watchlists.
   for (const win of BrowserWindow.getAllWindows()) {
-    if (!win || win.isDestroyed() || win.__sawPool) continue;
+    if (!win || win.isDestroyed()) continue;
     try { win.webContents.send('slack-autocomplete:last-seen-watchlist', lastSeenWatchlist); }
     catch (err) { /* ignore */ }
   }
@@ -612,7 +691,7 @@ function broadcastLastSeenChanged() {
   lastSeenChangedTimer = setTimeout(() => {
     lastSeenChangedTimer = null;
     for (const win of BrowserWindow.getAllWindows()) {
-      if (!win || win.isDestroyed() || win.__sawPool) continue;
+      if (!win || win.isDestroyed()) continue;
       try { win.webContents.send('slack-autocomplete:last-seen:changed'); }
       catch (err) { /* ignore */ }
     }
@@ -628,16 +707,24 @@ function writeWatchlistFile(users) {
 
 function watchWatchlistFile() {
   try {
-    if (watchlistWatcher) watchlistWatcher.close();
+    if (watchlistWatcher) { try { watchlistWatcher.close(); } catch (e) { /* ignore */ } watchlistWatcher = null; }
     watchlistWatcher = fs.watch(lastSeenWatchlistPath(), () => {
       if (watchlistReloadTimer) clearTimeout(watchlistReloadTimer);
       watchlistReloadTimer = setTimeout(() => {
         watchlistReloadTimer = null;
+        // fs.watch on macOS tracks the inode, and both our own saves and most
+        // editors replace the file via tmp+rename: after one such save the old
+        // watcher goes permanently silent (verified empirically). Re-arm on
+        // every event so the next save is still observed.
+        watchWatchlistFile();
         loadWatchlist();
         broadcastWatchlist();
       }, 300);
     });
-    watchlistWatcher.on('error', (err) => { console.warn('watchlist watcher error', err); });
+    watchlistWatcher.on('error', (err) => {
+      console.warn('watchlist watcher error', err);
+      setTimeout(() => watchWatchlistFile(), 1000);
+    });
   } catch (err) { console.warn('Failed to watch watchlist file', err); }
 }
 
@@ -1908,15 +1995,47 @@ ipcMain.handle('slack-autocomplete:open-import', async (event) => {
 });
 
 // --- Last-seen presence IPC ---
-let lastSeenCurrentSub = null; // { clientIds, injectedIds, at }
+// Every window (main, pop-outs, the hidden pool window) runs its own Slack
+// client with its own websocket and presence_sub frames. Subscriptions are
+// tracked per sender and unioned: treating any single frame as the global
+// subscription made lastSubscribedIds flip-flop between windows and pruned
+// baseline markers that other windows still held.
+const lastSeenSubsBySender = new Map(); // webContents.id -> { clientIds, injectedIds, at }
+const lastSeenSenderCleanup = new Set(); // webContents.id values with a destroyed-hook attached
+let lastSeenCurrentSub = null; // { clientIds, injectedIds, at } - union across senders
+
+function lastSeenSubUnion(at) {
+  const client = new Set(), injected = new Set();
+  for (const sub of lastSeenSubsBySender.values()) {
+    for (const id of sub.clientIds) client.add(id);
+    for (const id of sub.injectedIds) injected.add(id);
+  }
+  for (const id of client) injected.delete(id);
+  return { clientIds: Array.from(client), injectedIds: Array.from(injected), at };
+}
 
 ipcMain.on('slack-autocomplete:last-seen:event', (event, payload = {}) => {
   if (!isSlackSender(event)) return;
   const now = new Date().toISOString();
   try {
     if (payload.kind === 'sub') {
-      lastSeenCore.recordSubscription(lastSeenStore, payload.clientIds || [], payload.injectedIds || [], now);
-      lastSeenCurrentSub = { clientIds: payload.clientIds || [], injectedIds: payload.injectedIds || [], at: now };
+      const senderId = event.sender.id;
+      lastSeenSubsBySender.set(senderId, {
+        clientIds: lastSeenCore.dedupeValidIds(payload.clientIds),
+        injectedIds: lastSeenCore.dedupeValidIds(payload.injectedIds),
+        at: now
+      });
+      if (!lastSeenSenderCleanup.has(senderId)) {
+        lastSeenSenderCleanup.add(senderId);
+        event.sender.once('destroyed', () => {
+          lastSeenSubsBySender.delete(senderId);
+          lastSeenSenderCleanup.delete(senderId);
+        });
+      }
+      const union = lastSeenSubUnion(now);
+      lastSeenCore.recordSubscription(lastSeenStore, payload.clientIds || [], payload.injectedIds || [], now,
+        union.clientIds.concat(union.injectedIds));
+      lastSeenCurrentSub = union;
       scheduleLastSeenSave();
       broadcastLastSeenChanged();
     } else if (payload.kind === 'change') {
@@ -1935,22 +2054,38 @@ ipcMain.handle('slack-autocomplete:last-seen:snapshot', (event) => {
     users: lastSeenStore.users,
     subscriptionLog: lastSeenStore.subscriptionLog,
     currentSubscription: lastSeenCurrentSub,
-    watchlist: lastSeenWatchlist
+    watchlist: lastSeenWatchlist,
+    watchlistError: lastSeenWatchlistError
   };
 });
 
 ipcMain.handle('slack-autocomplete:last-seen:recent-transitions', (event, payload = {}) => {
   if (!isSlackSender(event)) throw new Error('last-seen rejected: untrusted sender');
   const limit = Math.max(1, Math.min(500, Number(payload.limit) || 50));
-  let text = '';
-  try { text = fs.readFileSync(lastSeenTransitionsPath(), 'utf8'); }
-  catch (err) { return []; }
-  const lines = text.split('\n').filter((l) => l.trim());
-  const out = [];
-  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
-    try { out.push(JSON.parse(lines[i])); } catch (e) { /* skip bad line */ }
+  loadTransitionsRing();
+  return lastSeenTxRing.slice(-limit).reverse(); // newest first
+});
+
+ipcMain.handle('slack-autocomplete:last-seen:names', (event) => {
+  if (!isSlackSender(event)) throw new Error('last-seen rejected: untrusted sender');
+  loadLastSeenNames();
+  return lastSeenNames;
+});
+
+ipcMain.on('slack-autocomplete:last-seen:names-merge', (event, entries) => {
+  if (!isSlackSender(event)) return;
+  if (!entries || typeof entries !== 'object') return;
+  loadLastSeenNames();
+  let changed = false;
+  for (const id of Object.keys(entries)) {
+    const name = entries[id];
+    if (!lastSeenCore.USER_ID_RE.test(id)) continue;
+    if (typeof name !== 'string' || !name || name === id || name.length > 200) continue;
+    if (lastSeenNames[id] === name) continue;
+    lastSeenNames[id] = name;
+    changed = true;
   }
-  return out;
+  if (changed) saveLastSeenNamesSoon();
 });
 
 ipcMain.handle('slack-autocomplete:last-seen:watchlist', (event) => {
@@ -2083,6 +2218,12 @@ app.on('before-quit', () => {
   isQuitting = true;
   saveWindowStateNow();
   flushLastSeenStore();
+  if (lastSeenNamesSaveTimer) {
+    clearTimeout(lastSeenNamesSaveTimer);
+    lastSeenNamesSaveTimer = null;
+    try { fs.writeFileSync(lastSeenNamesPath(), JSON.stringify(lastSeenNames)); }
+    catch (err) { /* ignore */ }
+  }
 });
 
 app.on('window-all-closed', () => {
@@ -4330,8 +4471,9 @@ cat > preload.js <<'EOF'
         var USER_ID_RE = /^[UW][A-Z0-9]{2,}$/;
         var CAP = 100;
         var watchlist = [];
-        var lastClientIds = null;   // ids from the most recent client presence_sub
-        var taps = [];              // instrumented sockets that have sent a sub
+        var taps = [];              // open sockets that have sent a presence_sub;
+                                    // each remembers its own client ids (Slack can
+                                    // run more than one socket per page)
 
         function dedupeValid(list) {
           var out = [], seen = {};
@@ -4367,6 +4509,11 @@ cat > preload.js <<'EOF'
           try { isSlack = /(^|\.)slack\.com$/.test(new URL(url).hostname); } catch (e) { isSlack = false; }
           if (!isSlack) return ws;
 
+          ws.addEventListener('close', function () {
+            var i = taps.indexOf(ws);
+            if (i !== -1) taps.splice(i, 1);
+          });
+
           ws.addEventListener('message', function (ev) {
             try {
               if (typeof ev.data !== 'string') return;
@@ -4387,7 +4534,7 @@ cat > preload.js <<'EOF'
                 var frame = JSON.parse(data);
                 if (frame && frame.type === 'presence_sub') {
                   var clientIds = dedupeValid(frame.ids);
-                  lastClientIds = clientIds;
+                  ws.__lsClientIds = clientIds;
                   if (taps.indexOf(ws) === -1) taps.push(ws);
                   var m = merge(clientIds);
                   emit('slack-autocomplete:ls-out', { clientIds: m.clientIds, injectedIds: m.injectedIds });
@@ -4409,21 +4556,19 @@ cat > preload.js <<'EOF'
         window.WebSocket = WrappedWS;
 
         // Watchlist updates from the isolated world. On change, proactively
-        // re-subscribe on any open tapped socket so new ids take effect without
-        // waiting for Slack's next presence_sub. Sending the client ids through
-        // our own send wrapper keeps a single merge path (it re-merges the
-        // current watchlist in, which is idempotent).
+        // re-subscribe each open tapped socket with its own client ids so new
+        // watchlist ids take effect without waiting for Slack's next
+        // presence_sub. Sending through our own send wrapper keeps a single
+        // merge path (it re-merges the current watchlist in, idempotently).
         document.addEventListener('slack-autocomplete:ls-watchlist', function (ev) {
           try {
             watchlist = dedupeValid(JSON.parse(ev.detail));
-            if (lastClientIds) {
-              var m = merge(lastClientIds);
-              for (var i = 0; i < taps.length; i++) {
-                var t = taps[i];
-                if (t && t.readyState === 1) {
-                  try { t.send(JSON.stringify({ type: 'presence_sub', ids: m.clientIds })); }
-                  catch (e) { /* ignore */ }
-                }
+            var open = taps.slice();
+            for (var i = 0; i < open.length; i++) {
+              var t = open[i];
+              if (t && t.readyState === 1 && t.__lsClientIds) {
+                try { t.send(JSON.stringify({ type: 'presence_sub', ids: t.__lsClientIds })); }
+                catch (e) { /* ignore */ }
               }
             }
           } catch (e) { /* ignore */ }
@@ -4470,14 +4615,51 @@ cat > preload.js <<'EOF'
   }
 
   // Resolve user ids to display names via the existing rate-limited api-call
-  // bridge, cached for the window's lifetime. Used by the Last Seen panel/export.
+  // bridge. Seeded from the persisted main-process cache, filled in bulk by
+  // the roster fetch when many ids are missing, and only then by per-id
+  // users.info calls (600ms apart). Used by the Last Seen panel/export.
   const lastSeenNameCache = {};
+  let lastSeenNamesSeedPromise = null;
+  function seedNameCache() {
+    if (!lastSeenNamesSeedPromise) {
+      lastSeenNamesSeedPromise = ipcRenderer.invoke('slack-autocomplete:last-seen:names')
+        .then((names) => {
+          if (!names || typeof names !== 'object') return;
+          for (const id of Object.keys(names)) {
+            if (!(id in lastSeenNameCache)) lastSeenNameCache[id] = names[id];
+          }
+        })
+        .catch(() => { lastSeenNamesSeedPromise = null; });
+    }
+    return lastSeenNamesSeedPromise;
+  }
+
+  function persistResolvedNames(ids) {
+    const entries = {};
+    for (const id of ids) {
+      const name = lastSeenNameCache[id];
+      if (typeof name === 'string' && name && name !== id) entries[id] = name;
+    }
+    if (Object.keys(entries).length) {
+      try { ipcRenderer.send('slack-autocomplete:last-seen:names-merge', entries); } catch (e) { /* ignore */ }
+    }
+  }
+
   async function resolveUserNames(ids) {
-    const missing = ids.filter((id) => !(id in lastSeenNameCache));
+    await seedNameCache();
+    let missing = ids.filter((id) => !(id in lastSeenNameCache));
+    if (missing.length > 5) {
+      // One roster page of 200 replaces 200 users.info round trips.
+      try { await fetchLastSeenRoster(); } catch (e) { /* fall back to users.info */ }
+      missing = ids.filter((id) => !(id in lastSeenNameCache));
+    }
     if (missing.length) {
       let cfg;
+      // Config not readable right now (e.g. still booting): resolve nothing
+      // and leave the cache untouched so the next call retries. Caching
+      // id->id here used to poison every name for the window's lifetime.
       try { cfg = getExportConfig(function () {}, { requireChannel: false }); }
-      catch (e) { for (const id of missing) lastSeenNameCache[id] = id; return lastSeenNameCache; }
+      catch (e) { return lastSeenNameCache; }
       const apiCall = createApiCall(cfg, null, function () {});
       for (const id of missing) {
         try {
@@ -4485,9 +4667,13 @@ cat > preload.js <<'EOF'
           if (resp && resp.ok && resp.user) {
             const e = exportCore.buildUserEntry(resp.user);
             lastSeenNameCache[id] = e.name || id;
-          } else { lastSeenNameCache[id] = id; }
-        } catch (e) { lastSeenNameCache[id] = id; }
+          } else {
+            // Definitive answer (user_not_found etc.): the id is its own name.
+            lastSeenNameCache[id] = id;
+          }
+        } catch (e) { /* transient failure: leave unresolved, retried next call */ }
       }
+      persistResolvedNames(missing);
     }
     return lastSeenNameCache;
   }
@@ -4495,6 +4681,7 @@ cat > preload.js <<'EOF'
   // Workspace roster for watchlist name search. Fetched once per window via
   // the rate-limited api-call bridge; also pre-fills the name cache.
   let lastSeenRoster = null;
+  let lastSeenRosterTruncated = false;
   let lastSeenRosterPromise = null;
   function fetchLastSeenRoster() {
     if (lastSeenRoster) return Promise.resolve(lastSeenRoster);
@@ -4518,6 +4705,7 @@ cat > preload.js <<'EOF'
           cursor = resp.response_metadata && resp.response_metadata.next_cursor;
           if (!cursor) break;
         }
+        lastSeenRosterTruncated = !!cursor; // page cap hit with results remaining
         lastSeenRoster = out;
         return out;
       })();
@@ -4527,8 +4715,13 @@ cat > preload.js <<'EOF'
   }
 
   // ---------------- Last Seen viewer panel ----------------
+  // Sections are persistent DOM updated in place, each guarded by a content
+  // signature. A refresh that changes nothing touches nothing, so buttons and
+  // the search input survive unrelated presence churn (the old full rebuild
+  // destroyed elements under the cursor and needed a blur-delay hack).
   function setupLastSeenPanel() {
     if (!ipcRenderer) return;
+    const BOX_KEY = 'slackAutocompleteLastSeenPanelBox';
     let root = null, visible = false;
     let txLimit = 50;
     let searchQuery = '';
@@ -4536,27 +4729,68 @@ cat > preload.js <<'EOF'
     let pendingSection = null;
     let refreshTimer = null;
     let rendering = false, renderQueued = false;
-    let dirtyWhileTyping = false;
+    let lastSnap = null, lastRecent = null;
+    let nameVersion = 0;
+    const sigs = { watchlist: '', tracked: '', sub: '', tx: '' };
+    const el = {};
+    const trackedRows = new Map(); // user id -> row element
+    let trackedOrderKey = null;
 
     function fmtTime(iso) {
       if (!iso) return '-';
       try { return new Date(iso).toLocaleString(); } catch (e) { return iso; }
     }
 
-    function searchHasFocus() {
-      const a = document.activeElement;
-      return !!(root && a && root.contains(a) && a.tagName === 'INPUT');
-    }
+    function nameOf(id) { return lastSeenNameCache[id] || id; }
 
     function scheduleRefresh() {
       if (!visible) return;
       if (refreshTimer) clearTimeout(refreshTimer);
       refreshTimer = setTimeout(() => {
         refreshTimer = null;
-        if (!visible) return;
-        if (searchHasFocus()) { dirtyWhileTyping = true; return; }
-        render();
+        if (visible) render();
       }, 500);
+    }
+
+    function loadPanelBox() {
+      try { return JSON.parse(window.localStorage.getItem(BOX_KEY) || 'null'); }
+      catch (e) { return null; }
+    }
+    function savePanelBox() {
+      try {
+        const r = root.getBoundingClientRect();
+        window.localStorage.setItem(BOX_KEY, JSON.stringify(
+          { left: r.left, top: r.top, width: r.width, height: r.height }));
+      } catch (e) { /* ignore */ }
+    }
+    function clampPanelBox() {
+      const r = root.getBoundingClientRect();
+      const left = Math.min(Math.max(0, r.left), Math.max(0, window.innerWidth - 120));
+      const top = Math.min(Math.max(0, r.top), Math.max(0, window.innerHeight - 80));
+      root.style.left = left + 'px';
+      root.style.top = top + 'px';
+      root.style.right = 'auto';
+    }
+
+    function makeDraggable(handle, ignoreEl) {
+      handle.addEventListener('mousedown', (ev) => {
+        if (ev.target === ignoreEl || ev.button !== 0) return;
+        ev.preventDefault();
+        const r = root.getBoundingClientRect();
+        const offX = ev.clientX - r.left, offY = ev.clientY - r.top;
+        const move = (e) => {
+          root.style.left = Math.min(Math.max(0, e.clientX - offX), window.innerWidth - 120) + 'px';
+          root.style.top = Math.min(Math.max(0, e.clientY - offY), window.innerHeight - 80) + 'px';
+          root.style.right = 'auto';
+        };
+        const up = () => {
+          window.removeEventListener('mousemove', move, true);
+          window.removeEventListener('mouseup', up, true);
+          savePanelBox();
+        };
+        window.addEventListener('mousemove', move, true);
+        window.addEventListener('mouseup', up, true);
+      });
     }
 
     function ensurePanel() {
@@ -4566,9 +4800,21 @@ cat > preload.js <<'EOF'
       root.style.cssText = 'position:fixed;top:44px;right:8px;width:380px;max-height:80vh;z-index:2147483000;'
         + 'background:#1d1c1d;color:#fff;border:1px solid #3a393a;border-radius:10px;'
         + 'box-shadow:0 10px 40px rgba(0,0,0,0.5);display:none;flex-direction:column;'
-        + 'font-family:-apple-system,Segoe UI,sans-serif;overflow:hidden;';
+        + 'font-family:-apple-system,Segoe UI,sans-serif;overflow:hidden;'
+        + 'resize:both;min-width:300px;min-height:220px;';
+      const saved = loadPanelBox();
+      if (saved && typeof saved === 'object') {
+        if (saved.width) root.style.width = Math.max(300, saved.width) + 'px';
+        if (saved.height) { root.style.height = Math.max(220, saved.height) + 'px'; root.style.maxHeight = 'none'; }
+        if (typeof saved.left === 'number' && typeof saved.top === 'number') {
+          root.style.left = saved.left + 'px';
+          root.style.top = saved.top + 'px';
+          root.style.right = 'auto';
+        }
+      }
       const header = document.createElement('div');
-      header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid #3a393a;';
+      header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:10px 12px;'
+        + 'border-bottom:1px solid #3a393a;cursor:move;user-select:none;flex:none;';
       const title = document.createElement('div');
       title.textContent = 'Last Seen';
       title.style.cssText = 'font-weight:700;font-size:14px;';
@@ -4577,19 +4823,40 @@ cat > preload.js <<'EOF'
       closeBtn.style.cssText = 'background:none;border:0;color:#9a9a9a;cursor:pointer;font-size:12px;';
       closeBtn.addEventListener('click', () => toggle(false));
       header.appendChild(title); header.appendChild(closeBtn);
+      makeDraggable(header, closeBtn);
 
       const warn = document.createElement('div');
-      warn.style.cssText = 'padding:8px 12px;background:#3d2f00;color:#f5d16a;font-size:11px;line-height:1.4;border-bottom:1px solid #3a393a;';
+      warn.style.cssText = 'padding:8px 12px;background:#3d2f00;color:#f5d16a;font-size:11px;line-height:1.4;border-bottom:1px solid #3a393a;flex:none;';
       warn.textContent = 'Presence is derived from live events: Slack throttles them (up to ~1 min lag), '
         + 'there is no backfill (tracking starts when the app does), and an "away" reading right after '
         + 'tracking a user only means they were already away, not that they just went offline.';
 
       const body = document.createElement('div');
       body.id = 'slack-autocomplete-last-seen-body';
-      body.style.cssText = 'overflow:auto;padding:8px 12px;font-size:12px;';
+      body.style.cssText = 'overflow:auto;padding:8px 12px;font-size:12px;flex:1;min-height:0;';
+
+      el.loadError = document.createElement('div');
+      el.loadError.style.cssText = 'color:#e06c6c;';
+      body.appendChild(el.loadError);
+
+      buildWatchlistSkeleton(body);
+      buildTrackedSkeleton(body);
+      buildSubSkeleton(body);
+      buildTxSkeleton(body);
 
       root.appendChild(header); root.appendChild(warn); root.appendChild(body);
       (document.body || document.documentElement).appendChild(root);
+
+      // The CSS resize handle gives no events; persist the box after the
+      // size settles.
+      try {
+        let sizeTimer = null;
+        new ResizeObserver(() => {
+          if (!visible) return;
+          if (sizeTimer) clearTimeout(sizeTimer);
+          sizeTimer = setTimeout(() => { sizeTimer = null; savePanelBox(); }, 400);
+        }).observe(root);
+      } catch (e) { /* ignore */ }
     }
 
     function section(titleText, anchorId) {
@@ -4608,122 +4875,226 @@ cat > preload.js <<'EOF'
       return b;
     }
 
-    async function updateWatchlist(change, statusEl) {
+    async function updateWatchlist(change) {
       try {
         const res = await ipcRenderer.invoke('slack-autocomplete:last-seen:watchlist-update', change);
         if (!res || !res.ok) throw new Error((res && res.error) || 'update failed');
         render();
       } catch (e) {
-        if (statusEl) statusEl.textContent = 'Watchlist update failed: ' + String((e && e.message) || e);
+        if (el.searchStatus) el.searchStatus.textContent = 'Watchlist update failed: ' + String((e && e.message) || e);
       }
     }
 
-    function buildWatchlistSection(body, watchlist, names) {
+    function buildWatchlistSkeleton(body) {
       body.appendChild(section('Watchlist', 'slack-autocomplete-ls-sec-watchlist'));
-      const watchSet = new Set(watchlist);
 
-      const search = document.createElement('input');
-      search.type = 'text';
-      search.placeholder = 'Search users by name (or paste a user ID)...';
-      search.value = searchQuery;
-      search.style.cssText = 'width:100%;box-sizing:border-box;background:#121212;color:#fff;'
+      el.search = document.createElement('input');
+      el.search.type = 'text';
+      el.search.placeholder = 'Search users by name (or paste a user ID)...';
+      el.search.style.cssText = 'width:100%;box-sizing:border-box;background:#121212;color:#fff;'
         + 'border:1px solid #3a393a;border-radius:6px;padding:5px 8px;font-size:12px;';
-      const status = document.createElement('div');
-      status.style.cssText = 'font-size:11px;color:#9a9a9a;padding:3px 0;min-height:14px;';
-      const results = document.createElement('div');
-
-      function matchRow(entry) {
-        const line = document.createElement('div');
-        line.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:3px 0;';
-        const label = document.createElement('span');
-        label.textContent = (entry.name || entry.id) + '  (' + entry.id + ')';
-        label.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
-        line.appendChild(label);
-        if (watchSet.has(entry.id)) {
-          const mark = document.createElement('span');
-          mark.textContent = 'added';
-          mark.style.cssText = 'color:#2bac76;font-size:11px;margin-left:8px;flex:none;';
-          line.appendChild(mark);
-        } else {
-          const add = rowButton('Add');
-          add.addEventListener('click', () => updateWatchlist({ add: entry.id }, status));
-          line.appendChild(add);
-        }
-        return line;
-      }
-
-      async function refreshResults() {
-        const q = searchQuery.trim();
-        results.textContent = '';
-        status.textContent = '';
-        if (q.length < 2) return;
-        let roster = null;
-        try {
-          if (!lastSeenRoster) status.textContent = 'Loading directory...';
-          roster = await fetchLastSeenRoster();
-          status.textContent = '';
-        } catch (e) {
-          status.textContent = 'directory unavailable - paste a user ID instead';
-        }
-        if (q !== searchQuery.trim()) return; // stale response, a newer query took over
-        let matches = roster ? lastSeenCore.filterRoster(roster, q, 10) : [];
-        if (!matches.length && lastSeenCore.USER_ID_RE.test(q.toUpperCase())) {
-          const id = q.toUpperCase();
-          const names2 = await resolveUserNames([id]);
-          matches = [{ id, name: names2[id] || id }];
-        }
-        results.textContent = '';
-        if (!matches.length && q.length >= 2 && roster) {
-          const p = document.createElement('div');
-          p.textContent = '(no matches)';
-          p.style.color = '#9a9a9a';
-          results.appendChild(p);
-        }
-        for (const m of matches) results.appendChild(matchRow(m));
-      }
-
-      search.addEventListener('input', () => {
-        searchQuery = search.value;
+      el.search.addEventListener('input', () => {
+        searchQuery = el.search.value;
         if (searchTimer) clearTimeout(searchTimer);
         searchTimer = setTimeout(() => { searchTimer = null; refreshResults(); }, 250);
       });
-      // Refreshes suppressed while the user was typing run once focus leaves.
-      // The 150ms delay lets a click on an Add/Remove button land before the
-      // DOM is rebuilt underneath it.
-      search.addEventListener('blur', () => {
-        setTimeout(() => {
-          if (dirtyWhileTyping && visible && !searchHasFocus()) {
-            dirtyWhileTyping = false;
-            render();
-          }
-        }, 150);
-      });
+      el.searchStatus = document.createElement('div');
+      el.searchStatus.style.cssText = 'font-size:11px;color:#9a9a9a;padding:3px 0;min-height:14px;';
+      el.results = document.createElement('div');
+      el.watchError = document.createElement('div');
+      el.watchError.style.cssText = 'color:#e06c6c;font-size:11px;padding:2px 0;display:none;';
+      el.watchCount = document.createElement('div');
+      el.watchCount.style.cssText = 'font-size:11px;color:#9a9a9a;padding:4px 0;';
+      el.watchRows = document.createElement('div');
 
-      body.appendChild(search);
-      body.appendChild(status);
-      body.appendChild(results);
+      body.appendChild(el.search);
+      body.appendChild(el.searchStatus);
+      body.appendChild(el.results);
+      body.appendChild(el.watchError);
+      body.appendChild(el.watchCount);
+      body.appendChild(el.watchRows);
+    }
 
-      const count = document.createElement('div');
-      count.textContent = watchlist.length + ' watched (100 injected max)';
-      count.style.cssText = 'font-size:11px;color:#9a9a9a;padding:4px 0;';
-      body.appendChild(count);
+    function matchRow(entry, watchSet) {
+      const line = document.createElement('div');
+      line.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:3px 0;';
+      const label = document.createElement('span');
+      label.textContent = (entry.name || entry.id) + '  (' + entry.id + ')';
+      label.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      line.appendChild(label);
+      if (watchSet.has(entry.id)) {
+        const mark = document.createElement('span');
+        mark.textContent = 'added';
+        mark.style.cssText = 'color:#2bac76;font-size:11px;margin-left:8px;flex:none;';
+        line.appendChild(mark);
+      } else {
+        const add = rowButton('Add');
+        add.addEventListener('click', () => updateWatchlist({ add: entry.id }));
+        line.appendChild(add);
+      }
+      return line;
+    }
+
+    async function refreshResults() {
+      const q = searchQuery.trim();
+      el.results.textContent = '';
+      el.searchStatus.textContent = '';
+      if (q.length < 2) return;
+      let roster = null;
+      try {
+        if (!lastSeenRoster) el.searchStatus.textContent = 'Loading directory...';
+        roster = await fetchLastSeenRoster();
+        el.searchStatus.textContent = lastSeenRosterTruncated
+          ? 'directory truncated at 5000 users - paste an ID for anyone missing' : '';
+      } catch (e) {
+        el.searchStatus.textContent = 'directory unavailable - paste a user ID instead';
+      }
+      if (q !== searchQuery.trim()) return; // stale response, a newer query took over
+      let matches = roster ? lastSeenCore.filterRoster(roster, q, 10) : [];
+      if (!matches.length && lastSeenCore.USER_ID_RE.test(q.toUpperCase())) {
+        const id = q.toUpperCase();
+        const names2 = await resolveUserNames([id]);
+        if (q !== searchQuery.trim()) return;
+        matches = [{ id, name: names2[id] || id }];
+      }
+      el.results.textContent = '';
+      const watchSet = new Set((lastSnap && lastSnap.watchlist) || []);
+      if (!matches.length && roster) {
+        const p = document.createElement('div');
+        p.textContent = '(no matches)';
+        p.style.color = '#9a9a9a';
+        el.results.appendChild(p);
+      }
+      for (const m of matches) el.results.appendChild(matchRow(m, watchSet));
+    }
+
+    function updateWatchlistSection(snap) {
+      const watchlist = snap.watchlist || [];
+      const sig = JSON.stringify([watchlist, snap.watchlistError || null, nameVersion]);
+      if (sig === sigs.watchlist) return;
+      sigs.watchlist = sig;
+
+      el.watchError.textContent = snap.watchlistError
+        ? 'Watchlist file error: ' + snap.watchlistError + ' (keeping the last good list)' : '';
+      el.watchError.style.display = snap.watchlistError ? '' : 'none';
+      el.watchCount.textContent = watchlist.length + ' watched (100 injected max)';
+
+      el.watchRows.textContent = '';
       if (!watchlist.length) {
         const p = document.createElement('div');
         p.textContent = '(watchlist is empty)';
-        body.appendChild(p);
+        el.watchRows.appendChild(p);
       }
       for (const id of watchlist) {
         const line = document.createElement('div');
         line.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:3px 0;border-bottom:1px solid #2a292a;';
         const label = document.createElement('span');
-        label.textContent = (names[id] || id) + '  (' + id + ')';
+        label.textContent = nameOf(id) + '  (' + id + ')';
         label.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
         const rm = rowButton('Remove');
-        rm.addEventListener('click', () => updateWatchlist({ remove: id }, status));
+        rm.addEventListener('click', () => updateWatchlist({ remove: id }));
         line.appendChild(label); line.appendChild(rm);
-        body.appendChild(line);
+        el.watchRows.appendChild(line);
       }
+      // Add/added marks in open search results follow the watchlist.
       if (searchQuery.trim().length >= 2) refreshResults();
+    }
+
+    function buildTrackedSkeleton(body) {
+      el.trackedTitle = section('Tracked users', null);
+      el.trackedEmpty = document.createElement('div');
+      el.trackedEmpty.textContent = 'No presence recorded yet.';
+      el.trackedList = document.createElement('div');
+      body.appendChild(el.trackedTitle);
+      body.appendChild(el.trackedEmpty);
+      body.appendChild(el.trackedList);
+    }
+
+    function updateTrackedSection(snap) {
+      const users = snap.users || {};
+      const watchlist = snap.watchlist || [];
+      const sig = JSON.stringify([users, watchlist, nameVersion]);
+      if (sig === sigs.tracked) return;
+      sigs.tracked = sig;
+
+      const watchSet = new Set(watchlist);
+      const order = lastSeenCore.orderTrackedIds(users);
+      el.trackedTitle.textContent = 'Tracked users (' + order.length + ')';
+      el.trackedEmpty.style.display = order.length ? 'none' : '';
+
+      for (const [id, row] of Array.from(trackedRows)) {
+        if (!(id in users)) { row.remove(); trackedRows.delete(id); }
+      }
+      for (const id of order) {
+        let row = trackedRows.get(id);
+        if (!row) {
+          row = document.createElement('div');
+          row.style.cssText = 'padding:3px 0;border-bottom:1px solid #2a292a;';
+          trackedRows.set(id, row);
+        }
+        const d = lastSeenCore.describeLastSeen(users[id]);
+        const online = d.state === 'online';
+        row.textContent = (online ? '● ' : '○ ') + nameOf(id)
+          + (watchSet.has(id) ? '  [watch]' : '')
+          + '  -  ' + (online ? 'online now' : fmtTime(d.lastOnlineAt));
+        row.style.color = online ? '#2bac76' : '#cccccc';
+      }
+      // appendChild moves existing nodes, so one pass in sorted order both
+      // inserts new rows and reorders old ones; skip it when order is stable.
+      const orderKey = order.join(',');
+      if (orderKey !== trackedOrderKey) {
+        trackedOrderKey = orderKey;
+        for (const id of order) el.trackedList.appendChild(trackedRows.get(id));
+      }
+    }
+
+    function buildSubSkeleton(body) {
+      body.appendChild(section('Currently subscribed', null));
+      el.subClient = document.createElement('div');
+      el.subInjected = document.createElement('div');
+      el.subInjected.style.color = '#7aa7ff';
+      body.appendChild(el.subClient);
+      body.appendChild(el.subInjected);
+    }
+
+    function updateSubSection(snap) {
+      const sub = snap.currentSubscription || { clientIds: [], injectedIds: [] };
+      const sig = JSON.stringify([sub.clientIds, sub.injectedIds, nameVersion]);
+      if (sig === sigs.sub) return;
+      sigs.sub = sig;
+      el.subClient.textContent = 'By Slack client: ' + ((sub.clientIds || []).map(nameOf).join(', ') || '(none)');
+      el.subInjected.textContent = 'Injected from watchlist: ' + ((sub.injectedIds || []).map(nameOf).join(', ') || '(none)');
+    }
+
+    function buildTxSkeleton(body) {
+      body.appendChild(section('Transition log', 'slack-autocomplete-ls-sec-transitions'));
+      el.txEmpty = document.createElement('div');
+      el.txEmpty.textContent = '(none logged yet)';
+      el.txList = document.createElement('div');
+      el.txMore = rowButton('Load more');
+      el.txMore.style.marginLeft = '0';
+      el.txMore.style.marginTop = '6px';
+      el.txMore.style.display = 'none';
+      el.txMore.addEventListener('click', () => { txLimit = Math.min(txLimit * 2, 500); render(); });
+      body.appendChild(el.txEmpty);
+      body.appendChild(el.txList);
+      body.appendChild(el.txMore);
+    }
+
+    function updateTxSection(recent) {
+      recent = recent || [];
+      const sig = JSON.stringify([recent, nameVersion, txLimit]);
+      if (sig === sigs.tx) return;
+      sigs.tx = sig;
+      el.txEmpty.style.display = recent.length ? 'none' : '';
+      el.txList.textContent = '';
+      for (const t of recent) {
+        const line = document.createElement('div');
+        line.style.cssText = 'padding:2px 0;color:#bdbdbd;';
+        line.textContent = fmtTime(t.at) + '  ' + nameOf(t.user) + '  ' + t.presence + (t.baseline ? '  (baseline)' : '');
+        el.txList.appendChild(line);
+      }
+      el.txMore.style.display = (recent.length >= txLimit && txLimit < 500) ? '' : 'none';
     }
 
     async function render() {
@@ -4736,82 +5107,61 @@ cat > preload.js <<'EOF'
       }
     }
 
+    function updateAllSections() {
+      if (!lastSnap) return;
+      updateWatchlistSection(lastSnap);
+      updateTrackedSection(lastSnap);
+      updateSubSection(lastSnap);
+      updateTxSection(lastRecent);
+    }
+
+    // Names resolve in the background: the panel paints immediately with ids
+    // and rows fill in as answers arrive (the old code awaited every
+    // users.info call - 600ms each - before the first paint).
+    let namesBusy = false;
+    const namesWanted = new Set();
+    function requestNames(ids) {
+      for (const id of ids || []) {
+        if (!(id in lastSeenNameCache)) namesWanted.add(id);
+      }
+      if (namesBusy || !namesWanted.size) return;
+      namesBusy = true;
+      const batch = Array.from(namesWanted);
+      namesWanted.clear();
+      resolveUserNames(batch)
+        .catch(() => {})
+        .then(() => {
+          namesBusy = false;
+          if (batch.some((id) => id in lastSeenNameCache)) {
+            nameVersion++;
+            if (visible) updateAllSections();
+          }
+          if (namesWanted.size) requestNames();
+        });
+    }
+
     async function renderNow() {
       ensurePanel();
-      const body = root.querySelector('#slack-autocomplete-last-seen-body');
-      const prevScroll = body.scrollTop;
-      if (!body.childNodes.length) body.textContent = 'Loading...';
       let snap, recent;
       try {
-        snap = await ipcRenderer.invoke('slack-autocomplete:last-seen:snapshot');
-        recent = await ipcRenderer.invoke('slack-autocomplete:last-seen:recent-transitions', { limit: txLimit });
-      } catch (e) { body.textContent = 'Failed to load last-seen data.'; return; }
+        [snap, recent] = await Promise.all([
+          ipcRenderer.invoke('slack-autocomplete:last-seen:snapshot'),
+          ipcRenderer.invoke('slack-autocomplete:last-seen:recent-transitions', { limit: txLimit })
+        ]);
+      } catch (e) { el.loadError.textContent = 'Failed to load last-seen data.'; return; }
+      el.loadError.textContent = '';
+      lastSnap = snap; lastRecent = recent;
+      updateAllSections();
 
-      const userIds = Object.keys(snap.users || {});
       const sub = snap.currentSubscription || { clientIds: [], injectedIds: [] };
-      const allIds = Array.from(new Set(userIds
+      requestNames(Object.keys(snap.users || {})
         .concat(sub.clientIds || []).concat(sub.injectedIds || [])
         .concat(snap.watchlist || [])
-        .concat((recent || []).map((t) => t.user))));
-      const names = await resolveUserNames(allIds);
-      const nameOf = (id) => (names[id] || id);
-      const watchSet = new Set(snap.watchlist || []);
+        .concat((recent || []).map((t) => t.user)));
 
-      body.textContent = '';
-
-      // Watchlist editor.
-      buildWatchlistSection(body, snap.watchlist || [], names);
-
-      // Tracked users, most recently online first.
-      body.appendChild(section('Tracked users (' + userIds.length + ')'));
-      const rows = userIds.map((id) => {
-        const d = lastSeenCore.describeLastSeen(snap.users[id]);
-        return { id, d };
-      }).sort((a, b) => String(b.d.lastOnlineAt || '').localeCompare(String(a.d.lastOnlineAt || '')));
-      if (!rows.length) { const p = document.createElement('div'); p.textContent = 'No presence recorded yet.'; body.appendChild(p); }
-      for (const r of rows) {
-        const line = document.createElement('div');
-        line.style.cssText = 'padding:3px 0;border-bottom:1px solid #2a292a;';
-        const online = r.d.state === 'online';
-        const lastOnline = online ? 'online now' : fmtTime(r.d.lastOnlineAt);
-        line.textContent = (online ? '● ' : '○ ') + nameOf(r.id)
-          + (watchSet.has(r.id) ? '  [watch]' : '')
-          + '  -  ' + lastOnline;
-        line.style.color = online ? '#2bac76' : '#cccccc';
-        body.appendChild(line);
-      }
-
-      // Live subscription view.
-      body.appendChild(section('Currently subscribed'));
-      const subBox = document.createElement('div');
-      const cIds = (sub.clientIds || []).map(nameOf).join(', ') || '(none)';
-      const iIds = (sub.injectedIds || []).map(nameOf).join(', ') || '(none)';
-      const cLine = document.createElement('div'); cLine.textContent = 'By Slack client: ' + cIds;
-      const iLine = document.createElement('div'); iLine.style.color = '#7aa7ff'; iLine.textContent = 'Injected from watchlist: ' + iIds;
-      subBox.appendChild(cLine); subBox.appendChild(iLine);
-      body.appendChild(subBox);
-
-      // Transition log with resolved names.
-      body.appendChild(section('Transition log', 'slack-autocomplete-ls-sec-transitions'));
-      if (!recent || !recent.length) { const p = document.createElement('div'); p.textContent = '(none logged yet)'; body.appendChild(p); }
-      for (const t of (recent || [])) {
-        const line = document.createElement('div');
-        line.style.cssText = 'padding:2px 0;color:#bdbdbd;';
-        line.textContent = fmtTime(t.at) + '  ' + nameOf(t.user) + '  ' + t.presence + (t.baseline ? '  (baseline)' : '');
-        body.appendChild(line);
-      }
-      if (recent && recent.length >= txLimit && txLimit < 500) {
-        const more = rowButton('Load more');
-        more.style.marginLeft = '0';
-        more.style.marginTop = '6px';
-        more.addEventListener('click', () => { txLimit = Math.min(txLimit * 2, 500); render(); });
-        body.appendChild(more);
-      }
-
-      body.scrollTop = prevScroll;
       if (pendingSection) {
-        const el = root.querySelector('#slack-autocomplete-ls-sec-' + pendingSection);
-        if (el) { try { el.scrollIntoView({ block: 'start' }); } catch (e) { /* ignore */ } }
+        const target = root.querySelector('#slack-autocomplete-ls-sec-' + pendingSection);
+        if (target) { try { target.scrollIntoView({ block: 'start' }); } catch (e) { /* ignore */ } }
         pendingSection = null;
       }
     }
@@ -4820,7 +5170,12 @@ cat > preload.js <<'EOF'
       ensurePanel();
       visible = (show === undefined) ? !visible : show;
       root.style.display = visible ? 'flex' : 'none';
-      if (visible) render();
+      if (visible) {
+        clampPanelBox();
+        seedNameCache();
+        fetchLastSeenRoster().catch(() => {}); // warm the bulk name source
+        render();
+      }
     }
 
     ipcRenderer.on('slack-autocomplete:last-seen:show-panel', (_event, payload) => {
